@@ -1,0 +1,18 @@
+ ~/.joerc: Joe's Own Editor
+ Lines that start with a space are comments; options start in column 1.
+
+ No backup files (file~)
+-nobackups
+
+ Defaults for every file: no word wrap, syntax highlighting,
+ indent step 4, tab width 4
+--wordwrap
+-highlight
+-istep 4
+-tab 4
+
+ Everything else (key bindings, menus, file types) comes from the stock
+ config, so it stays current when joe is upgraded.  The file type table is
+ read from ~/.joe/ftyperc, which is the stock table without its "-wordwrap"
+ lines.  These options must stay above the include to apply to all types.
+:include /opt/homebrew/etc/joe/joerc

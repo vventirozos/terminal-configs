@@ -1,0 +1,10 @@
+# Never commit these, even if they get copied in by accident
+.zsh_secrets
+*secrets*
+.env
+.envrc
+*history*
+.ssh/
+*.pem
+*.key
+.DS_Store

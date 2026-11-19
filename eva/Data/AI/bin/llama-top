@@ -1,0 +1,1696 @@
+#!/usr/bin/env python3
+"""
+llama-top — a btop/htop-style live dashboard for llama-server logs.
+
+Full-screen curses UI that tails llama-server.log and shows, refreshing in
+place:
+  • server status + llama-server build + model + context window + watch time
+  • context-fill gauge and live prefill / generation meters
+  • scrolling area graphs of prefill and generation throughput (t/s)
+  • the current task on every busy slot (live prefill % / generation progress)
+  • a table of the most recent completed turns
+  • a session footer (totals, averages, prompt-cache hit rate)
+
+This is standalone — it does NOT import llama-mon. The two tools do share one
+verbatim block of log-grammar source (marked BEGIN/END shared log-grammar
+block); --self-test checks that the sibling's copy has not drifted, because
+"fixed one tool, forgot the other" is how the last format break survived.
+
+Usage:
+    llama-top                       # follow default log, seed graphs from history
+    llama-top /path/to/llama.log
+    llama-top --from-start          # seed graphs from the whole file
+    llama-top --tail 8000           # seed from last 8000 lines (default 4000)
+    llama-top --interval 0.1        # redraw cadence in seconds (default 0.2)
+    llama-top --server http://host:8088   # where to query /props (build, ctx)
+    llama-top --no-color
+    llama-top --audit               # report parser coverage over the log
+    llama-top --self-test           # exercise parser/graph logic without a TTY
+
+Keys:  q / Esc quit   ·   c cycle color theme (C reverse)   ·   b cycle
+       background (B reverse)   ·   x clear session stats   ·   p pause
+"""
+import argparse
+import json
+import locale
+import os
+import re
+import sys
+import threading
+import time
+from collections import deque
+
+DEFAULT_LOG = "/Users/vasilis/Data/AI/Logs/llama-server.log"
+DEFAULT_CTX_MAX = 262144          # fallback until /props or the log tells us
+DEFAULT_SERVER = "http://127.0.0.1:8088"
+# Meter full-scale. Measured peaks on this host are ~1230 t/s prefill and
+# ~90 t/s generation; both meters also grow to fit anything faster observed,
+# so a hardware or model change cannot peg them silently.
+PP_FULL = 1200.0
+TG_FULL = 90.0
+MAX_SLOT_ROWS = 4                 # busy slots rendered in the Current task box
+# A slot with no log activity for this long is treated as no longer busy. A
+# turn that is cut off mid-flight (log rotated, server killed) never gets its
+# release line, and without this the panel would show it as running forever.
+STALE_SLOT_SECS = 180.0
+# Prefill samples smaller than this are mostly fixed per-request overhead
+# (measured: 4-32 token prefills average ~55 t/s against ~600 t/s for real
+# prompts), so they are shown per turn but kept out of graphs and averages.
+PP_STAT_MIN_TOK = 64
+# Live slot state from GET /slots. The server answers between batches, so a
+# reply can lag by one ubatch on a long prefill; samples older than
+# LIVE_FRESH fall back to log-derived numbers.
+SLOTS_POLL_SECS = 0.5
+LIVE_FRESH = 12.0
+LIVE_RATE_WINDOW = 3.0
+
+
+# ----------------------------------------------------------------------------
+# Parser + log grammar
+# ----------------------------------------------------------------------------
+
+# ==== BEGIN shared log-grammar block (kept byte-identical in llama-mon/llama-top)
+#
+# llama-server's log grammar drifted around build b10621. What changed:
+#   "n_decoded = N, tg = X t/s"   -> "n_gen = N, tg = X t/s, tg_3s = Y t/s"
+#   "sim_best = X"                -> "f_sim_best = X"
+#   "server is listening on U"    -> "listening on U"
+#   "new slot, n_ctx = N"         -> "initializing, n_slots = M, n_ctx_slot = N"
+#   "system_info: n_threads ..."  -> "common_params_print_info: verbosity = N"
+#   "all slots are idle"          -> gone; idleness is derived from slot state
+#   "restored context checkpoint" -> gone; superseded by a server-wide prompt
+#                                    cache that only announces itself on eviction
+# New: "graphs reused", "making room for prompt cache entry", "stop: cancel
+# task", per-request "got exception", MTP draft init, and multi-slot serving
+# (n_slots > 1), which is why every per-request pattern now carries a slot id.
+#
+# Pre-b10621 shapes are all still matched so archived logs keep replaying.
+
+_LINE = re.compile(r"^(\S+)\s+([IWE])\s+(.*)$")
+# Nearly every per-request line is prefixed "id <slot> | task <id> |".
+_SLOTID = re.compile(r"\bid\s+(\d+)\s*\|\s*task\s+(-?\d+)\b")
+
+_PATTERNS = [
+    # -- faults first: they contain words the lifecycle patterns also match --
+    ("oom",          r"(Insufficient Memory \(.*?\)|kIOGPUCommandBufferCallbackErrorOutOfMemory)"),
+    ("load_error",   r"(?:error loading model: |failed to load model[,:]?\s*)(.*)"),
+    ("load_abort",   r"exiting due to model loading error"),
+    ("slot_anomaly", r"(non-consecutive token position \d+ after \d+.*"
+                     r"|removing memory module entries for seq_id.*)"),
+    ("fit_error",    r"(failed to fit params to free device memory.*)"),
+    ("decode_fail",  r"decode\(\) failed: (.*)"),
+    ("spec_fail",    r"(failed to process speculative batch|llama_decode\(ctx_dft\).*)"),
+    ("backend_err",  r"(ggml_metal_synchronize: error: .*"
+                     r"|backend is in error state.*"
+                     r"|failed to compute graph.*"
+                     r"|llama_decode: failed to decode.*"
+                     r"|ggml_backend_sched_graph_compute_async failed.*)"),
+    ("req_error",    r"got exception: (.*)"),
+    # -- process lifecycle ---------------------------------------------------
+    ("boot",         r"(?:common_params_print_info: verbosity|system_info: n_threads)"),
+    ("load_start",   r": loading model\b(?:\s*'([^']+)')?"),
+    ("mmproj",       r"loaded multimodal model, '([^']+)'"),
+    ("spec_draft",   r"creating MTP draft context against the target model '([^']+)'"),
+    ("init_slots",   r"initializing, n_slots = (\d+), n_ctx_slot = (\d+)"),
+    ("new_slot",     r"new slot,\s*n_ctx = (\d+)"),
+    ("model_loaded", r": model loaded\b"),
+    ("listening",    r"\blistening on (\S+)"),
+    ("shutdown",     r"cleaning up before exit"),
+    ("ctx_warn",     r"n_ctx_seq \((\d+)\) < n_ctx_train \((\d+)\)"),
+    ("cors_warn",    r"CORS is set to allow all origins"),
+    ("chat_format",  r"Chat format: (\S+)"),
+    # -- scheduling / prompt cache -------------------------------------------
+    ("pick_lcp",     r"selected slot by LCP similarity,\s*f?_?sim_best = ([\d.]+)"
+                     r".*?f_keep = ([\d.]+)"),
+    ("pick_lru",     r"selected slot by LRU"),
+    ("launch",       r"launch_slot_:.*processing task"),
+    ("cache_evict",  r"making room for prompt cache entry, removing oldest entry"
+                     r" \(size = ([\d.]+) MiB\)"),
+    ("cancel",       r"stop: cancel task, id_task = (\d+)"),
+    ("restored",     r"restored context checkpoint \(pos_min = (\d+).*?"
+                     r"n_tokens = (\d+).*?size = ([\d.]+) MiB\)"),
+    ("checkpoint",   r"created context checkpoint (\d+) of (\d+) \(.*?"
+                     r"n_tokens = (\d+), size = ([\d.]+) MiB\)"),
+    ("reason_on",    r"reasoning-budget: activated"),
+    ("reason_off",   r"reasoning-budget: deactivated"),
+    # -- per-turn timings ----------------------------------------------------
+    ("prefill_prog", r"prompt processing, n_tokens =\s*(\d+), progress = ([\d.]+),"
+                     r" t =\s*([\d.]+) s / ([\d.]+) tokens per second"),
+    ("gen_prog",     r"n_(?:gen|decoded) =\s*(\d+), tg =\s*([\d.]+) t/s"
+                     r"(?:,\s*tg_3s =\s*([\d.]+) t/s)?"),
+    ("pp_final",     r"\| prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens"
+                     r" \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)"),
+    ("tg_final",     r"\|\s+eval time =\s*([\d.]+) ms /\s*(\d+) tokens"
+                     r" \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)"),
+    ("total_time",   r"total time =\s*([\d.]+) ms /\s*(\d+) tokens"),
+    ("graphs",       r"graphs reused =\s*(\d+)"),
+    ("draft_acc",    r"draft acceptance = ([\d.]+) \(\s*(\d+) accepted /"
+                     r"\s*(\d+) generated\)(?:, mean len =\s*([\d.]+))?"),
+    ("release",      r"release:.*stop processing: n_tokens = (\d+), truncated = (\d+)"),
+    ("idle",         r"update_slots: all slots are idle"),
+]
+_PATTERNS = [(kind, re.compile(rx)) for kind, rx in _PATTERNS]
+
+
+def parse_line(text):
+    """Classify one log line.
+
+    Returns a dict(kind, lvl, slot, task, groups, raw), or None if the line is
+    not a llama-server log line at all. Unrecognized log lines come back with
+    kind "other" so callers can audit coverage instead of silently dropping
+    them -- that silence is exactly how the b10621 drift went unnoticed.
+    """
+    m = _LINE.match(text)
+    if not m:
+        return None
+    lvl, body = m.group(2), m.group(3)
+    slot = task = None
+    ms = _SLOTID.search(body)
+    if ms:
+        slot = int(ms.group(1))
+        task = int(ms.group(2))
+        if task < 0:            # "task -1" is the scheduler talking, not a turn
+            task = None
+    for kind, rx in _PATTERNS:
+        g = rx.search(body)
+        if g:
+            return dict(kind=kind, lvl=lvl, slot=slot, task=task,
+                        groups=g.groups(), raw=text)
+    return dict(kind="other", lvl=lvl, slot=slot, task=task, groups=(), raw=text)
+
+
+# Two different questions, deliberately kept apart.
+#
+# ZONES answers "how full is the context window" and is the label the UI prints
+# next to the fullness gauge, so it MUST mean the same thing that gauge does.
+# Keying it on an absolute token count instead makes it contradict the
+# percentage sitting beside it: 27.9k of a 262k window is 11% full, which is
+# not "long" by any reading a person would give it.
+ZONES = [  # (label, upper bound as a fraction of the context window)
+    ("short",     0.125),
+    ("medium",    0.30),
+    ("long",      0.50),
+    ("very-long", 0.75),
+    ("extreme",   None),
+]
+
+
+def ctx_zone(ctx, n_ctx):
+    """Fullness band: how much of the serving window this turn occupies."""
+    frac = (ctx / float(n_ctx)) if n_ctx else 0.0
+    for label, hi in ZONES:
+        if hi is None or frac < hi:
+            return label
+    return ZONES[-1][0]
+
+
+# SPEED_BANDS answers "how fast should this turn have been", and is keyed on
+# ABSOLUTE context instead, because attention cost tracks the KV size actually
+# in play rather than what fraction of a configured window it happens to
+# occupy: a 30k-token prompt costs the same whether the window is 64k or 262k.
+# Measured over ~9k real turns on this host (llama-server b10621, 35B-A3B MoE
+# + MTP draft, Metal).
+SPEED_BANDS = [  # (ctx upper bound, expected prefill t/s, expected gen t/s)
+    (8000,  1050, 78),
+    (16000,  800, 66),
+    (32000,  715, 61),
+    (65536,  480, 48),
+    (None,   300, 35),
+]
+
+
+def expected_rates(ctx):
+    """Typical (prefill t/s, generation t/s) at a given absolute context."""
+    for hi, pp, tg in SPEED_BANDS:
+        if hi is None or ctx < hi:
+            return pp, tg
+    return SPEED_BANDS[-1][1], SPEED_BANDS[-1][2]
+
+
+# llama-server emits degenerate timing lines for near-empty evals, e.g.
+# "eval time = 0.00 ms / 1 tokens ( ... 1000000.00 tokens per second)".
+# A sample must clear these floors/caps to count toward graphs and averages.
+SANE_MIN_TOK = 4
+SANE_MIN_MS = 50.0
+PP_SANE_MAX = 50000.0
+TG_SANE_MAX = 2000.0
+
+
+def sane_sample(tok, ms, rate, cap):
+    return bool(tok) and tok >= SANE_MIN_TOK and (ms or 0.0) >= SANE_MIN_MS \
+        and rate is not None and rate <= cap
+
+
+def read_tail_lines(path, n, upto=None, max_bytes=(32 << 20)):
+    """Last n lines of a file, reading only the tail rather than the whole file.
+
+    The default log is ~12 MB and grows; the old implementation did
+    f.read().splitlines()[-n:], which paged all of it in on every start and on
+    every rotation-triggered reopen.
+
+    `upto` caps the read at a byte offset. Callers that then follow the file
+    MUST pass the offset they will resume from, otherwise any line appended
+    between this read and their seek is silently skipped.
+    """
+    if n <= 0:
+        return []
+    with open(path, "rb") as b:
+        if upto is None:
+            b.seek(0, os.SEEK_END)
+            size = b.tell()
+        else:
+            size = upto
+        pos, data, step = size, b"", (1 << 20)
+        while pos > 0 and data.count(b"\n") <= n and (size - pos) < max_bytes:
+            back = min(step, pos)
+            pos -= back
+            b.seek(pos)
+            data = b.read(back) + data
+    lines = data.decode("utf-8", "replace").splitlines()
+    if pos > 0 and lines:
+        lines = lines[1:]       # first line is probably a fragment
+    return lines[-n:]
+
+
+def audit_log(path, top=25, limit=None):
+    """Report parser coverage over a real log, ranking unrecognized shapes.
+
+    This is the drift alarm: the built-in self-test only proves the parser
+    still handles lines someone thought to write down, which is why it stayed
+    green through an upgrade that broke live parsing.
+    """
+    from collections import Counter
+    num = re.compile(r"\d+")
+    seen, unknown, examples = Counter(), Counter(), {}
+    total = nolog = 0
+    with open(path, "r", errors="replace") as f:
+        for i, ln in enumerate(f):
+            if limit and i >= limit:
+                break
+            ln = ln.rstrip("\n")
+            if not ln.strip():
+                continue
+            total += 1
+            ev = parse_line(ln)
+            if ev is None:
+                nolog += 1
+                continue
+            seen[ev["kind"]] += 1
+            if ev["kind"] == "other":
+                shape = num.sub("N", ev["raw"].split(" ", 1)[-1])[:110]
+                unknown[shape] += 1
+                examples.setdefault(shape, ev["raw"])
+    known = total - nolog - seen["other"]
+    print("log       : %s" % path)
+    print("lines     : %d  (recognized %d = %.1f%%, unrecognized %d, non-log %d)"
+          % (total, known, 100.0 * known / max(1, total), seen["other"], nolog))
+    print("\nrecognized kinds:")
+    for kind, c in seen.most_common():
+        if kind != "other":
+            print("  %-14s %7d" % (kind, c))
+    missing = [k for k, _ in _PATTERNS if not seen.get(k)]
+    if missing:
+        print("\nnever seen in this log (may be fine, may be drift):")
+        print("  " + ", ".join(sorted(set(missing))))
+    if unknown:
+        print("\ntop unrecognized shapes:")
+        for shape, c in unknown.most_common(top):
+            print("  %7d  %s" % (c, shape))
+    return 0
+# ==== END shared log-grammar block
+
+
+# ----------------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------------
+
+def human_k(n):
+    n = float(n or 0)
+    if abs(n) >= 1e9:
+        return "%.1fG" % (n / 1e9)
+    if abs(n) >= 1e6:
+        return "%.1fM" % (n / 1e6)
+    if abs(n) >= 1000:
+        return "%.1fk" % (n / 1000.0)
+    return "%d" % n
+
+
+def server_props(url, timeout=1.5):
+    """Best-effort GET /props from a running llama-server.
+    Returns dict(version, n_ctx, model, slots) or None if unreachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/props", timeout=timeout) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    model = os.path.basename(d.get("model_path") or d.get("model_alias") or "")
+    model = re.sub(r"\.gguf$", "", model)
+    return dict(version=d.get("build_info"),
+                n_ctx=(d.get("default_generation_settings") or {}).get("n_ctx"),
+                model=model or None,
+                slots=d.get("total_slots"))
+
+
+# zone fill colors, gradient green -> red across the five ctx_zone bands
+ZONE_COLOR = {
+    "short": "grn", "medium": "grn", "long": "yel",
+    "very-long": "red", "extreme": "red",
+}
+
+# ----------------------------------------------------------------------------
+# Color themes — mactop-style rotating schemes, dark-leaning 256-color values.
+# Roles: grn=ctx, mag=processing/prefill, cyn=generating, yel=warn, red=crit,
+# blu=footer/accent, gry=chrome. 'alts' are spare colors used to keep the
+# ctx/processing/generating trio distinct when a background collides.
+# ----------------------------------------------------------------------------
+
+THEMES = [
+    dict(name="classic", grn=2,   mag=5,   cyn=6,   yel=3,   red=1,
+         blu=4,   gry=245, alts=[10, 13, 14]),
+    dict(name="ember",   grn=130, mag=125, cyn=136, yel=180, red=124,
+         blu=95,  gry=101, alts=[166, 208, 88]),
+    dict(name="ocean",   grn=30,  mag=61,  cyn=38,  yel=143, red=167,
+         blu=25,  gry=60,  alts=[45, 105, 24]),
+    dict(name="forest",  grn=28,  mag=100, cyn=37,  yel=136, red=88,
+         blu=65,  gry=102, alts=[34, 71, 22]),
+    dict(name="dusk",    grn=96,  mag=61,  cyn=132, yel=180, red=125,
+         blu=104, gry=59,  alts=[139, 97, 55]),
+    # mactop built-ins. 1977: fixed retro ANSI per component (CPU green,
+    # GPU magenta, MEM blue, ANE red, gray labels) -> ctx=blue (memory),
+    # prefill=green (cpu), gen=magenta (gpu), orange accent for the '77 logo.
+    dict(name="1977",    grn=4,   mag=2,   cyn=5,   yel=3,   red=1,
+         blu=208, gry=245, alts=[166, 33, 129]),
+    # macchiato: Catppuccin Macchiato pastels, nearest xterm-256 — ctx=Green,
+    # prefill=Mauve, gen=Sapphire (mactop's primary), warn=Yellow, crit=Red,
+    # accent=Blue, chrome=Subtext0.
+    dict(name="macchiato", grn=150, mag=183, cyn=116, yel=223, red=210,
+         blu=111, gry=146, alts=[147, 218, 216]),
+]
+BACKGROUNDS = [
+    ("default", -1), ("black", 16), ("charcoal", 234),
+    ("navy", 17), ("ink", 53),
+]
+
+# 8-color terminals: single theme, default/black backgrounds only
+THEMES_BASIC = [
+    dict(name="classic", grn=2, mag=5, cyn=6, yel=3, red=1, blu=4, gry=7,
+         alts=[]),
+]
+BACKGROUNDS_BASIC = [("default", -1), ("black", 0)]
+
+
+def compose(theme, bg, limit=256):
+    """Resolve a theme against a background: ctx (grn), processing (mag) and
+    generating (cyn) must stay mutually distinct and never match the bg."""
+    out = dict(theme)
+    spare = [c for c in list(theme.get("alts", ())) + [208, 39, 205, 118, 250, 15]
+             if c < limit]
+    used = {bg}
+    for role in ("grn", "mag", "cyn"):
+        c = out[role]
+        while c in used and spare:
+            c = spare.pop(0)
+        used.add(c)
+        out[role] = c
+    for role in ("yel", "red", "blu", "gry"):
+        while out[role] == bg and spare:
+            out[role] = spare.pop(0)
+    return out
+
+
+def meter(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    f = int(round(frac * width))
+    return "▕" + "█" * f + "░" * (width - f) + "▏"
+
+
+def gauge(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    f = int(round(frac * width))
+    return "[" + "█" * f + "░" * (width - f) + "]"
+
+
+def _stat_label(win, fmt, w):
+    """'┤ peak X · avg Y · low Z ├' over the visible window (dashes if empty).
+
+    Numbers are right-padded to width w so the label keeps a fixed length and
+    stays put frame-to-frame; the ┤ ├ caps merge into the box's top border.
+    """
+    if win:
+        nums = [(fmt % v).rjust(w)
+                for v in (max(win), sum(win) / len(win), min(win))]
+    else:
+        nums = ["—".rjust(w)] * 3
+    return "┤ peak %s · avg %s · low %s ├" % (nums[0], nums[1], nums[2])
+
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def graph_rows(vals, width, height, floor=1.0):
+    """Return (rows, max) for an area chart; newest sample at the right."""
+    vals = list(vals)[-width:]
+    mx = max(vals) if vals else 0.0
+    mx = max(mx, floor)
+    if len(vals) < width:
+        vals = [0.0] * (width - len(vals)) + vals
+    cols = [int(round((v / mx) * height * 8)) for v in vals]
+    rows = []
+    for r in range(height):
+        cb = (height - 1 - r) * 8
+        line = "".join(
+            "█" if (h - cb) >= 8 else (" " if (h - cb) <= 0 else _BLOCKS[h - cb])
+            for h in cols)
+        rows.append(line)
+    return rows, mx
+
+
+# ----------------------------------------------------------------------------
+# Shared state, updated by the tail thread, read by the draw loop
+# ----------------------------------------------------------------------------
+
+def log_ts(raw):
+    """Seconds since server start from a 'MIN.SS.mmm.uuu' log prefix."""
+    try:
+        m, s, ms, us = raw.split(" ", 1)[0].split(".")
+        return int(m) * 60 + int(s) + int(ms) / 1e3 + int(us) / 1e6
+    except (ValueError, IndexError):
+        return None
+
+
+def new_slot_state(slot, task):
+    # live_pp_total / live_pp_eta are None when the size of this turn's
+    # prefill cannot be known yet (no /slots, no cache estimate, too little
+    # progress to extrapolate) -- better blank than confidently wrong.
+    return dict(slot=slot, task=task, last_seen=time.time(),
+                pick=None, sim=None, fkeep=None, cache_est=None,
+                restored=None, evicted=0, evicted_mib=0.0, cancelled=False,
+                phase="PREFILL", gen_start=None, src="log",
+                pp_first=None, prompt_est=None, live_ctx=None,
+                live_pp_n=0, live_pp_frac=0.0, live_pp_total=None,
+                live_pp_rate=0.0, live_pp_eta=None,
+                live_gen_n=0, live_gen_rate=0.0, live_gen_rate3=None,
+                gen_secs=None,
+                pp_tok=None, pp_rate=None, pp_ms=None, ttft=None,
+                tg_tok=None, tg_rate=None, tg_ms=None,
+                acc=None, mean_len=None, total=None)
+
+
+class State:
+    def __init__(self, ctx_max):
+        self.lock = threading.Lock()
+        self.start = time.time()
+        self.phase = "INIT"          # INIT / LOADING / ERROR / READY
+        self.version = "?"
+        self.model = "?"
+        self.n_ctx = ctx_max
+        self.n_slots = 1
+        self.last_ctx = 0
+        # in-flight work, keyed by slot id
+        self.slots = {}
+        self.pending_pick = {}
+        self.task2slot = {}
+        # Evictions are announced by the server, not by a slot, so they are
+        # attributed to the next turn that launches. With more than one slot
+        # in flight that attribution can land on the wrong turn; the session
+        # total is exact, the per-turn number is indicative.
+        self.pending_evict = []
+        # context each slot held when it last released, for estimating the
+        # reused prefix (f_keep x previous ctx) when /slots is unavailable
+        self.slot_ctx = {}
+        # live view from GET /slots: {slot: dict(proc, task, P, C, done, dec,
+        # pp, tg)}; live_ts is when it was fetched, live_ok whether it works
+        self.live = {}
+        self.live_ts = 0.0
+        self.live_ok = False
+        # last completed metrics
+        self.pp_rate = 0.0
+        self.tg_rate = 0.0
+        self.ttft = 0.0
+        self.draft = None
+        self.hit = None
+        # history / table / session
+        self.pp_hist = deque(maxlen=400)
+        self.tg_hist = deque(maxlen=400)
+        self.ctx_hist = deque(maxlen=400)
+        self.turns = deque(maxlen=200)
+        self.s_turns = 0
+        self.s_gen = 0
+        self.s_prefill = 0
+        self.s_prompt = 0
+        self.s_reuse = 0
+        self.s_evict = 0
+        self.s_cancel = 0
+        self.s_errors = 0
+        self.last_error = ""
+
+    # -- derived -----------------------------------------------------------
+    def busy_slots(self, now=None):
+        """In-flight slots: log-derived state, overridden by /slots when a
+        fresh sample exists. Returns {slot: dict} of copies."""
+        now = now or time.time()
+        slots = {sid: dict(x) for sid, x in _prune_stale(self, now).items()}
+        if not (self.live_ok and now - self.live_ts < LIVE_FRESH):
+            return slots
+        # The server is the authority on what is running: this drops turns
+        # whose release line was lost and adds ones the log has not shown yet.
+        for sid in list(slots):
+            lv = self.live.get(sid)
+            if not lv or not lv["proc"]:
+                del slots[sid]
+        # What /slots fields mean (probed live on this build, see self-test):
+        #   n_prompt_tokens_cache     exact reused prefix, set at launch
+        #   n_prompt_tokens_processed new prompt tokens evaluated so far; moves
+        #                             once per 2048-token chunk, like the log
+        #   n_prompt_tokens           tokens currently IN the slot (cached +
+        #                             loaded chunks + generated) -- NOT the full
+        #                             prompt size, which /slots never exposes
+        #   next_token.n_decoded      generated so far, updates per token
+        # So the prompt size still comes from the log's progress line, but
+        # with the cached prefix now exact instead of estimated.
+        for sid, lv in self.live.items():
+            if not lv["proc"]:
+                continue
+            sl = slots.get(sid) or new_slot_state(sid, lv["task"])
+            sl["src"] = "api"
+            if lv["dec"] > 0:
+                sl["phase"] = "GENERATING"
+                sl["live_gen_n"] = max(sl["live_gen_n"], lv["dec"])
+                if lv["tg"] is not None:
+                    sl["live_gen_rate3"] = lv["tg"]
+                    if not sl["live_gen_rate"]:
+                        sl["live_gen_rate"] = lv["tg"]
+            else:
+                sl["phase"] = "PREFILL"
+                n = max(sl["live_pp_n"], lv["done"])
+                p = sl["live_pp_frac"]
+                if p > 0 and sl["live_pp_n"]:
+                    prompt = (lv["C"] + sl["live_pp_n"]) / p
+                    remaining = max(0.0, prompt - lv["C"] - n)
+                    sl["live_pp_total"] = int(round(n + remaining))
+                    rate = lv.get("pp_wall") or sl["live_pp_rate"]
+                    sl["live_pp_rate"] = rate
+                    # counters move once per chunk (~10s at long context);
+                    # count the ETA down in between instead of freezing it
+                    since = max(0.0, now - lv.get("done_t", now))
+                    sl["live_pp_eta"] = max(0.0, remaining / rate - since) \
+                        if rate else None
+                sl["live_pp_n"] = n
+            sl["live_ctx"] = lv["P"]
+            slots[sid] = sl
+        return slots
+
+    def status(self, slots=None):
+        """Derived, not stored: "all slots are idle" no longer exists in the
+        log, so idleness is whether any slot is still in flight."""
+        if self.phase in ("LOADING", "ERROR", "INIT"):
+            return self.phase
+        live = self.busy_slots() if slots is None else slots
+        for s in live.values():
+            if s["phase"] == "GENERATING":
+                return "GENERATING"
+        if live:
+            return "PREFILL"
+        return "IDLE"
+
+
+def _slot_of(stt, ev, create=True):
+    sid = ev["slot"]
+    if sid is None:
+        return None
+    s = stt.slots.get(sid)
+    if s is None and create:
+        s = stt.slots[sid] = new_slot_state(sid, ev["task"] or "?")
+    if s is not None:
+        s["last_seen"] = time.time()
+    return s
+
+
+def _prune_stale(stt, now=None):
+    """Drop slots that have gone silent. Returns the live ones."""
+    now = now or time.time()
+    for sid, s in list(stt.slots.items()):
+        if now - s["last_seen"] > STALE_SLOT_SECS:
+            del stt.slots[sid]
+    return stt.slots
+
+
+def apply_event(stt, ev):
+    kind, g = ev["kind"], ev["groups"]
+    with stt.lock:
+        if kind == "other":
+            # The agent swaps slot state files in and out; after a restore the
+            # slot's previous ctx no longer describes what is cached in it.
+            if ev["slot"] is not None and "load_slot_" in ev["raw"]:
+                stt.slot_ctx.pop(ev["slot"], None)
+            return
+        if kind == "boot":
+            stt.phase = "LOADING"
+            stt.last_ctx = 0
+            stt.slot_ctx.clear()
+            stt.slots.clear()
+            stt.pending_pick.clear()
+            stt.task2slot.clear()
+            stt.pending_evict = []
+        elif kind == "load_start":
+            stt.phase = "LOADING"
+            if g and g[0]:
+                stt.model = re.sub(r"\.gguf$", "", os.path.basename(g[0]))[:48]
+        elif kind == "init_slots":
+            stt.n_slots = int(g[0])
+            stt.n_ctx = int(g[1])
+        elif kind == "new_slot":                 # pre-b10621 logs
+            stt.n_ctx = int(g[0])
+        elif kind == "mmproj":
+            if stt.model == "?":  # fallback for logs without a model path
+                base = os.path.basename(g[0])
+                base = re.sub(r"\.gguf$", "", base)
+                base = re.sub(r"^mmproj-|\.mmproj$", "", base)
+                stt.model = base[:48]
+        elif kind in ("model_loaded", "listening"):
+            stt.phase = "READY"
+        elif kind == "shutdown":
+            stt.phase = "INIT"
+            stt.slots.clear()
+        elif kind in ("load_error", "load_abort"):
+            stt.phase = "ERROR"
+            stt.s_errors += 1
+            stt.last_error = (g[0] if g else "model failed to load")[:70]
+        elif kind in ("oom", "fit_error", "decode_fail", "spec_fail",
+                      "backend_err", "req_error"):
+            stt.s_errors += 1
+            stt.last_error = re.sub(r"\s+", " ", (g[0] or kind))[:70]
+
+        elif kind == "pick_lcp":
+            stt.pending_pick[ev["slot"]] = ("lcp", float(g[0]),
+                                            float(g[1]) if g[1] else None)
+        elif kind == "pick_lru":
+            stt.pending_pick[ev["slot"]] = ("lru", None, None)
+        elif kind == "cache_evict":
+            mib = float(g[0])
+            stt.pending_evict.append(mib)
+            stt.s_evict += 1
+        elif kind == "cancel":
+            sid = stt.task2slot.get(int(g[0]))
+            if sid is not None and sid in stt.slots:
+                stt.slots[sid]["cancelled"] = True
+            stt.s_cancel += 1
+
+        elif kind == "launch":
+            sid = ev["slot"]
+            s = new_slot_state(sid, ev["task"] or "?")
+            pick = stt.pending_pick.pop(sid, None)
+            if pick:
+                s["pick"], s["sim"], s["fkeep"] = pick
+                # Reused prefix ~= f_keep x what the slot held last time.
+                # Checked over 11k LCP turns: median error 10 tokens.
+                prev = stt.slot_ctx.get(sid)
+                if pick[0] == "lcp" and pick[2] is not None and prev:
+                    s["cache_est"] = int(round(prev * pick[2]))
+            if stt.pending_evict:
+                s["evicted"] = len(stt.pending_evict)
+                s["evicted_mib"] = sum(stt.pending_evict)
+                stt.pending_evict = []
+            stt.slots[sid] = s
+            if ev["task"] is not None:
+                stt.task2slot[ev["task"]] = sid
+                # A task killed mid-turn never releases; without a bound its
+                # entry would live for the lifetime of the process.
+                if len(stt.task2slot) > 512:
+                    for old_task in sorted(stt.task2slot)[:256]:
+                        stt.task2slot.pop(old_task, None)
+        elif kind == "restored":                 # pre-b10621 logs
+            s = _slot_of(stt, ev)
+            if s:
+                s["restored"] = int(g[1])
+        elif kind == "prefill_prog":
+            s = _slot_of(stt, ev)
+            if s:
+                _prefill_progress(s, int(g[0]), float(g[1]), float(g[3]))
+        elif kind == "gen_prog":
+            s = _slot_of(stt, ev)
+            if s:
+                s["phase"] = "GENERATING"
+                n, tg = int(g[0]), float(g[1])
+                s["live_gen_n"] = n
+                s["live_gen_rate"] = tg          # cumulative average this turn
+                s["live_gen_rate3"] = float(g[2]) if g[2] else None
+                # The first progress line only appears ~100 tokens in, so
+                # wall-clock-since-first-line undercounts; n / avg rate doesn't.
+                s["gen_secs"] = (n / tg) if tg else None
+                if s["prompt_est"]:
+                    s["live_ctx"] = s["prompt_est"] + n
+        elif kind == "pp_final":
+            s = _slot_of(stt, ev)
+            if s:
+                s["ttft"] = float(g[0]) / 1000.0
+                s["pp_ms"] = float(g[0])
+                s["pp_tok"] = int(g[1])
+                s["pp_rate"] = float(g[3])
+        elif kind == "tg_final":
+            s = _slot_of(stt, ev)
+            if s:
+                s["tg_ms"] = float(g[0])
+                s["tg_tok"] = int(g[1])
+                s["tg_rate"] = float(g[3])
+        elif kind == "total_time":
+            s = _slot_of(stt, ev)
+            if s:
+                s["total"] = float(g[0]) / 1000.0
+        elif kind == "draft_acc":
+            s = _slot_of(stt, ev)
+            if s:
+                s["acc"] = float(g[0])
+                s["mean_len"] = float(g[3]) if g[3] else None
+        elif kind == "release":
+            _finish(stt, ev, int(g[0]), int(g[1]))
+
+
+def _prefill_progress(s, n, prog, rate):
+    """Apply one 'prompt processing' line.
+
+    The server's `progress` is over the WHOLE prompt, cached prefix included:
+    progress = (cached + n) / prompt. `n` is only what this turn evaluated.
+    (Verified over 15k real turns: max deviation 0.005, i.e. rounding.) The
+    old reading, total = n / progress, called a 50k-cached / 10k-new prompt
+    85% done after 1k tokens, with an ETA off by a factor of ~50.
+    """
+    s["phase"] = "PREFILL"
+    s["live_pp_n"] = n
+    s["live_pp_frac"] = prog
+    s["live_pp_rate"] = rate
+    if s["pp_first"] is None:
+        s["pp_first"] = (n, prog)
+    prompt = None
+    if s["cache_est"] is not None and prog > 0:
+        prompt = (s["cache_est"] + n) / prog
+    else:
+        # Extrapolate from two progress lines: d(n)/d(progress) = prompt.
+        # Progress is printed to 2 decimals, so require a real spread.
+        n0, p0 = s["pp_first"]
+        if prog - p0 >= 0.05 and n > n0:
+            prompt = (n - n0) / (prog - p0)
+    if prompt:
+        remaining = max(0.0, prompt * (1.0 - prog))
+        s["prompt_est"] = int(round(prompt))
+        s["live_pp_total"] = int(round(n + remaining))
+        s["live_pp_eta"] = (remaining / rate) if rate else None
+        s["live_ctx"] = int(round(prompt * prog))
+    else:
+        s["live_pp_total"] = None
+        s["live_pp_eta"] = None
+
+
+def _finish(stt, ev, ctx, truncated):
+    sid = ev["slot"]
+    s = stt.slots.pop(sid, None) or new_slot_state(sid, ev["task"] or "?")
+    stt.task2slot.pop(s["task"], None)
+    if stt.phase not in ("LOADING", "ERROR"):
+        stt.phase = "READY"
+    stt.last_ctx = ctx
+    if sid is not None:
+        stt.slot_ctx[sid] = ctx
+    zone = ctx_zone(ctx, stt.n_ctx)
+    pp = s["pp_rate"] or 0.0
+    tg = s["tg_rate"] or 0.0
+    pp_ok = sane_sample(s["pp_tok"], s["pp_ms"], pp, PP_SANE_MAX)
+    tg_ok = sane_sample(s["tg_tok"], s["tg_ms"], tg, TG_SANE_MAX)
+    # pp_ok = believable number for the table; pp_stat = representative
+    # enough of prefill throughput to go into the graph and averages
+    pp_stat = pp_ok and s["pp_tok"] >= PP_STAT_MIN_TOK
+    if pp_stat:
+        stt.pp_rate = pp
+        stt.pp_hist.append(pp)
+    if tg_ok:
+        stt.tg_rate = tg
+        stt.tg_hist.append(tg)
+    stt.ctx_hist.append(ctx)
+    stt.ttft = s["ttft"] or 0.0
+    stt.draft = s["acc"]
+
+    # Prompt-cache accounting: the part of the prompt that never had to be
+    # re-evaluated. Exact to within one token on real logs, hence the clamp.
+    hit = None
+    if s["pp_tok"] is not None and s["tg_tok"] is not None:
+        prompt_total = max(0, ctx - s["tg_tok"])
+        reuse = max(0, prompt_total - s["pp_tok"])
+        hit = (reuse / float(prompt_total)) if prompt_total else 0.0
+        stt.s_prompt += prompt_total
+        stt.s_reuse += reuse
+    stt.hit = hit
+
+    stt.turns.appendleft(dict(
+        task=s["task"], slot=sid, ctx=ctx, pp=pp, tg=tg,
+        pp_ok=pp_ok, tg_ok=tg_ok, pp_stat=pp_stat,
+        pp_tok=s["pp_tok"] or 0, pp_ms=s["pp_ms"] or 0.0,
+        tg_tok=s["tg_tok"] or 0, tg_ms=s["tg_ms"] or 0.0,
+        ttft=s["ttft"] or 0.0, draft=s["acc"],
+        hit=hit, evicted=s["evicted"], zone=zone, trunc=truncated,
+        cancelled=s["cancelled"]))
+    stt.s_turns += 1
+    stt.s_gen += s["tg_tok"] or 0
+    stt.s_prefill += s["pp_tok"] or 0
+
+
+def fetch_props(stt, url):
+    """Pull build/n_ctx/model from the server's /props into shared state."""
+    props = server_props(url)
+    if not props:
+        return
+    with stt.lock:
+        if props.get("version"):
+            stt.version = props["version"]
+        if props.get("n_ctx"):
+            stt.n_ctx = int(props["n_ctx"])
+        if props.get("slots"):
+            stt.n_slots = int(props["slots"])
+        if props.get("model") and stt.model == "?":
+            stt.model = props["model"][:48]
+
+
+def _parse_slots(data):
+    """GET /slots JSON -> {slot: dict(proc, task, P, C, done, dec)}."""
+    out = {}
+    for d in data if isinstance(data, list) else []:
+        nt = d.get("next_token")
+        if isinstance(nt, list):
+            nt = nt[0] if nt else {}
+        out[int(d.get("id", 0))] = dict(
+            proc=bool(d.get("is_processing")),
+            task=d.get("id_task"),
+            P=int(d.get("n_prompt_tokens") or 0),
+            C=int(d.get("n_prompt_tokens_cache") or 0),
+            done=int(d.get("n_prompt_tokens_processed") or 0),
+            dec=int((nt or {}).get("n_decoded") or 0))
+    return out
+
+
+def poll_slots(url, stt, stop):
+    """Keep stt.live in sync with GET /slots, with windowed live rates.
+
+    The log only reports progress every few seconds and never says how big a
+    prefill is; /slots gives exact prompt / cached / processed / decoded
+    counts. If the endpoint is disabled (--no-slots) or the server is down,
+    live_ok goes False and everything falls back to the log.
+    """
+    import urllib.request
+    import urllib.error
+    hist = {}                     # slot -> deque[(t, task, done, dec)]
+    moved = {}                    # slot -> (task, done, when done last moved)
+    endpoint = url.rstrip("/") + "/slots"
+    while not stop.is_set():
+        try:
+            with urllib.request.urlopen(endpoint, timeout=LIVE_FRESH) as r:
+                data = json.load(r)
+            now = time.time()
+            live = _parse_slots(data)
+        except urllib.error.HTTPError:
+            with stt.lock:
+                stt.live_ok = False   # endpoint disabled; don't hammer it
+            stop.wait(10.0)
+            continue
+        except Exception:
+            with stt.lock:
+                stt.live_ok = False
+            stop.wait(2.0)
+            continue
+        for sid, lv in live.items():
+            # (task, done, when done moved, turn first seen, chunk rate)
+            prev = moved.get(sid)
+            if not prev or prev[0] != lv["task"]:
+                moved[sid] = prev = (lv["task"], lv["done"], now, now, None)
+            elif prev[1] != lv["done"]:
+                chunk = prev[4]
+                step = lv["done"] - prev[1]
+                # a whole chunk observed, big enough that 0.5s poll jitter
+                # doesn't swamp it; blend so one odd chunk can't swing the ETA
+                if prev[1] > 0 and step >= 512 and now > prev[2]:
+                    r = step / (now - prev[2])
+                    chunk = r if chunk is None else 0.5 * (chunk + r)
+                moved[sid] = prev = (lv["task"], lv["done"], now, prev[3], chunk)
+            lv["done_t"] = prev[2]
+            # Prefill rate for the ETA. The log's own rate starts its clock
+            # late (after slot save/restore and setup) and ran ~2x optimistic
+            # in a live probe (392 vs 190 t/s). Prefill also slows as context
+            # fills, so the latest whole chunk beats the turn average; until
+            # one has been seen, use wall clock since the turn appeared.
+            busy = prev[2] - prev[3]
+            lv["pp_wall"] = prev[4] or ((lv["done"] / busy)
+                                        if lv["done"] and busy > 1.0 else None)
+            h = hist.setdefault(sid, deque())
+            if not lv["proc"] or (h and h[-1][1] != lv["task"]):
+                h.clear()
+            if lv["proc"] and lv["dec"] > 0:     # gen-rate window: decode only
+                h.append((now, lv["task"], lv["done"], lv["dec"]))
+            while h and now - h[0][0] > LIVE_RATE_WINDOW and len(h) > 2:
+                h.popleft()
+            # Generation rate only: the prefill counter moves in 2048-token
+            # chunks, so a windowed delta of it is spikes and zeros. The log's
+            # cumulative prefill rate is the honest one.
+            lv["tg"] = None
+            if len(h) >= 2 and h[-1][0] - h[0][0] > 0.2:
+                dtg = h[-1][3] - h[0][3]
+                if dtg > 0:
+                    lv["tg"] = dtg / (h[-1][0] - h[0][0])
+        # Sanity: if the counters don't add up, this build reports them
+        # differently than assumed -- don't let them override the log.
+        sane = all(lv["C"] + lv["done"] <= lv["P"] + 1 for lv in live.values()
+                   if lv["proc"])
+        with stt.lock:
+            stt.live = live
+            stt.live_ts = now
+            stt.live_ok = sane
+            if stt.phase == "INIT":   # answering /slots means it is up, even
+                stt.phase = "READY"   # if the seeded history held no boot line
+        stop.wait(SLOTS_POLL_SECS)
+
+
+# ----------------------------------------------------------------------------
+# Tail thread
+# ----------------------------------------------------------------------------
+
+def tail_thread(path, stt, from_start, tail_n, stop, server):
+    if server:
+        fetch_props(stt, server)
+    first = True
+    while not stop.is_set():
+        try:
+            f = open(path, "r", errors="replace")
+        except FileNotFoundError:
+            time.sleep(0.5)
+            continue
+        inode = os.fstat(f.fileno()).st_ino
+        if not first:
+            pass                      # rotated file: read the new one from 0
+        elif from_start:
+            pass
+        elif tail_n:
+            # Pin the resume offset BEFORE reading and resume from exactly it:
+            # seeking to END afterwards would drop anything appended between.
+            end = os.fstat(f.fileno()).st_size
+            for ln in read_tail_lines(path, tail_n, upto=end):
+                ev = parse_line(ln)
+                if ev:
+                    apply_event(stt, ev)
+            f.seek(end)
+            # history may hold an older run's init line (different n_ctx);
+            # the running server is the authority, so ask it again
+            if server:
+                fetch_props(stt, server)
+        else:
+            f.seek(0, os.SEEK_END)
+        first = False
+        buf = ""
+        while not stop.is_set():
+            chunk = f.readline()
+            if chunk:
+                buf += chunk
+                if buf.endswith("\n"):
+                    ev = parse_line(buf.rstrip("\n"))
+                    if ev:
+                        apply_event(stt, ev)
+                        if ev["kind"] == "listening" and server:
+                            fetch_props(stt, server)  # server (re)started
+                    buf = ""
+                continue
+            time.sleep(0.2)
+            try:
+                sres = os.stat(path)
+                if sres.st_ino != inode or sres.st_size < f.tell():
+                    break  # rotated/truncated -> reopen
+            except FileNotFoundError:
+                break
+        f.close()
+
+
+# ----------------------------------------------------------------------------
+# Curses rendering
+# ----------------------------------------------------------------------------
+
+STATUS_COLOR = {
+    "GENERATING": "cyn", "PREFILL": "mag", "IDLE": "grn",
+    "LOADING": "yel", "ERROR": "red", "INIT": "gry",
+}
+
+
+class UI:
+    def __init__(self, scr, use_color):
+        import curses
+        self.curses = curses
+        self.scr = scr
+        self.color = use_color and curses.has_colors()
+        self.pairs = {}
+        self.theme_i = 0
+        self.bg_i = 0
+        self.many = False
+        self.theme_name = ""
+        self.bg_name = ""
+        if self.color:
+            curses.start_color()
+            curses.use_default_colors()
+            self.many = curses.COLORS >= 256
+            self.apply_colors()
+
+    def apply_colors(self):
+        """(Re)build the 7 role pairs from the active theme/background; the
+        whole UI recolors on the next draw since attrs reference the pairs."""
+        curses = self.curses
+        themes = THEMES if self.many else THEMES_BASIC
+        bgs = BACKGROUNDS if self.many else BACKGROUNDS_BASIC
+        theme = themes[self.theme_i % len(themes)]
+        bg_name, bg = bgs[self.bg_i % len(bgs)]
+        colors = compose(theme, bg, curses.COLORS)
+        for i, name in enumerate(("grn", "yel", "red", "cyn", "mag", "blu",
+                                  "gry"), 1):
+            curses.init_pair(i, colors[name], bg)
+            self.pairs[name] = curses.color_pair(i) | (
+                curses.A_DIM if name == "gry" and not self.many else 0)
+        curses.init_pair(8, colors["gry"], bg)   # fills blank cells too
+        self.scr.bkgd(" ", curses.color_pair(8))
+        self.theme_name = theme["name"]
+        self.bg_name = bg_name
+
+    def cycle_theme(self, step=1):
+        if self.color:
+            self.theme_i += step
+            self.apply_colors()
+
+    def cycle_bg(self, step=1):
+        if self.color:
+            self.bg_i += step
+            self.apply_colors()
+
+    def attr(self, *styles):
+        a = 0
+        for s in styles:
+            if s == "bold":
+                a |= self.curses.A_BOLD
+            elif self.color and s in self.pairs:
+                a |= self.pairs[s]
+        return a
+
+    def aw(self, y, x, s, *styles):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        if x < 0:
+            s = s[-x:]
+            x = 0
+        s = s[:max(0, w - x)]
+        try:
+            self.scr.addstr(y, x, s, self.attr(*styles))
+        except self.curses.error:
+            pass
+
+    def box(self, y, x, h, w, title="", *styles):
+        if h < 2 or w < 2:
+            return
+        self.aw(y, x, "┌" + "─" * (w - 2) + "┐", *styles)
+        for i in range(1, h - 1):
+            self.aw(y + i, x, "│", *styles)
+            self.aw(y + i, x + w - 1, "│", *styles)
+        self.aw(y + h - 1, x, "└" + "─" * (w - 2) + "┘", *styles)
+        if title:
+            self.aw(y, x + 2, " " + title + " ", "bold", *styles)
+
+
+def draw(ui, stt, paused):
+    scr = ui.scr
+    scr.erase()
+    H, W = scr.getmaxyx()
+    if H < 14 or W < 50:
+        ui.aw(0, 0, "terminal too small (need >= 50x14)", "yel")
+        scr.noutrefresh()
+        return
+
+    with stt.lock:
+        s = _snapshot(stt)
+
+    iw = W - 4  # inner content width for full-width panels
+
+    # ---- header ----
+    title = "llama-server"
+    if s["version"] not in (None, "", "?"):
+        title += " " + s["version"]
+    ui.box(0, 0, 3, W, title, "gry")
+    dot_c = STATUS_COLOR.get(s["status"], "gry")
+    ui.aw(1, 2, "●", dot_c, "bold")
+    ui.aw(1, 4, "%-11s" % s["status"], dot_c, "bold")
+    up = int(time.time() - s["start"])
+    hdr = "model %s   ctx %s   %d slot%s   watching %02d:%02d:%02d" % (
+        s["model"], human_k(s["n_ctx"]), s["n_slots"],
+        "" if s["n_slots"] == 1 else "s",
+        up // 3600, (up % 3600) // 60, up % 60)
+    ui.aw(1, 16, hdr, "gry")
+    if paused:
+        ui.aw(1, W - 10, "[PAUSED]", "yel", "bold")
+    y = 3
+
+    # ---- current task (one row per busy slot) ----
+    busy = sorted(s["slots"], key=lambda x: x["slot"])[:MAX_SLOT_ROWS]
+    cur_h = 2 + max(1, len(busy))
+    ui.box(y, 0, cur_h, W, "Current task", "gry")
+    if not busy:
+        if s["status"] == "LOADING":
+            ui.aw(y + 1, 2, "loading model…", "yel")
+        elif s["status"] == "ERROR":
+            ui.aw(y + 1, 2, "error: %s" % s["last_error"], "red", "bold")
+        else:
+            ui.aw(y + 1, 2, "idle — waiting for next request", "gry")
+    for i, sl in enumerate(busy):
+        pfx = ("s%d " % sl["slot"]) if s["n_slots"] > 1 else ""
+        if sl["phase"] == "GENERATING":
+            rate = sl["live_gen_rate"]
+            el = sl["gen_secs"] or ((sl["live_gen_n"] / rate) if rate else 0)
+            now3 = sl["live_gen_rate3"]
+            line = "%stask %s  generating  %s tok  avg %.1f t/s%s  %.0fs" % (
+                pfx, sl["task"], human_k(sl["live_gen_n"]), rate,
+                ("  now %.1f" % now3) if now3 is not None else "", el)
+            ui.aw(y + 1 + i, 2, line, "cyn")
+        else:
+            tot = sl["live_pp_total"]
+            if tot:
+                frac = min(1.0, sl["live_pp_n"] / float(tot))
+                size = "%s/%s new tok" % (human_k(sl["live_pp_n"]), human_k(tot))
+            else:   # size unknown: show the server's whole-prompt progress
+                frac = sl["live_pp_frac"]
+                size = "%s new tok, %d%% of prompt" % (
+                    human_k(sl["live_pp_n"]), round(100 * frac))
+            eta = sl["live_pp_eta"]
+            line = "%stask %s  prefill %3d%% %s %s  %.0f t/s  ETA %s" % (
+                pfx, sl["task"], round(100 * frac),
+                meter(frac, min(16, iw - 60)), size, sl["live_pp_rate"],
+                ("%.0fs" % eta) if eta is not None else "—")
+            ui.aw(y + 1 + i, 2, line, "mag")
+    y += cur_h
+
+    # ---- now panel ----
+    ui.box(y, 0, 5, W, "Now", "gry")
+    # in flight: what the busy slot holds right now, not the last finished turn
+    live_ctxs = [sl["live_ctx"] for sl in busy if sl.get("live_ctx")]
+    ctx = max(live_ctxs) if live_ctxs else s["last_ctx"]
+    frac = ctx / float(s["n_ctx"]) if s["n_ctx"] else 0
+    zone = ctx_zone(ctx, s["n_ctx"])
+    fcol = "red" if frac >= 0.95 else ("yel" if frac >= 0.85 else "grn")
+    ui.aw(y + 1, 2, "context  ", "gry")
+    gline = "%s %s/%s  %d%%  " % (
+        gauge(frac, min(34, iw - 30)), human_k(ctx), human_k(s["n_ctx"]),
+        round(frac * 100))
+    ui.aw(y + 1, 11, gline, fcol)
+    ui.aw(y + 1, 11 + len(gline), "zone %s%s" % (zone, "  (live)" if live_ctxs else ""),
+          ZONE_COLOR.get(zone, "gry"))
+    live_pp = max([sl["live_pp_rate"] for sl in busy
+                   if sl["phase"] == "PREFILL"] or [0.0])
+    # the meter is "now": prefer the ~3s windowed rate over the turn average
+    live_tg = max([(sl["live_gen_rate3"] if sl["live_gen_rate3"] is not None
+                    else sl["live_gen_rate"]) for sl in busy
+                   if sl["phase"] == "GENERATING"] or [0.0])
+    pp = live_pp or s["pp_rate"]
+    tg = live_tg or s["tg_rate"]
+    # full-scale grows to fit anything faster than the measured baseline
+    pp_full = max(PP_FULL, max(s["pp_hist"] or [0.0]), pp)
+    tg_full = max(TG_FULL, max(s["tg_hist"] or [0.0]), tg)
+    mw = min(28, iw - 24)
+    ui.aw(y + 2, 2, "prefill  ", "gry")
+    ui.aw(y + 2, 11, "%s %5.0f t/s" % (meter(pp / pp_full, mw), pp), "mag")
+    ui.aw(y + 3, 2, "gen      ", "gry")
+    extra = "  TTFT %.1fs  draft %s  cache %s" % (
+        s["ttft"],
+        ("%d%%" % round(s["draft"] * 100)) if s["draft"] is not None else "—",
+        ("%d%%" % round(s["hit"] * 100)) if s["hit"] is not None else "—")
+    ui.aw(y + 3, 11, "%s %5.1f t/s" % (meter(tg / tg_full, mw), tg), "cyn")
+    ui.aw(y + 3, 11 + mw + 12, extra, "gry")
+    y += 5
+
+    # ---- size the three graphs + table for remaining vertical space ----
+    foot_h = 1
+    rest = H - (y + foot_h)
+    if rest < 12:
+        gh = max(3, rest // 3)
+        table_h = 0
+    else:
+        gh = max(4, min(9, (rest - 4) // 3))
+        table_h = rest - 3 * gh
+        if table_h < 4:
+            table_h = 0
+            gh = max(4, rest // 3)
+
+    # ---- recent turns table ----
+    if table_h >= 4:
+        ui.box(y, 0, table_h, W, "Recent turns", "gry")
+        # the slot column is a constant 0 on a single-slot server, so drop it
+        multi = s["n_slots"] > 1
+        cols = ("%-4s " % "slot" if multi else "") + "%-8s %7s %8s %8s %7s %6s %6s  %s" % (
+            "task", "ctx", "pp t/s", "gen t/s", "TTFT", "draft", "cache", "zone")
+        ui.aw(y + 1, 2, cols, "gry", "bold")
+        for i, t in enumerate(s["turns"][:table_h - 3]):
+            zc = ZONE_COLOR.get(t["zone"], "gry")
+            dr = ("%d%%" % round(t["draft"] * 100)) if t["draft"] is not None else "—"
+            hb = ("%d%%" % round(t["hit"] * 100)) if t.get("hit") is not None else "—"
+            sc = ("%-4s " % (t["slot"] if t["slot"] is not None else "—")) if multi else ""
+            row = sc + "%-8s %7s %8s %8s %6.1fs %6s %6s  %s" % (
+                t["task"], human_k(t["ctx"]),
+                ("%.0f" % t["pp"]) if t.get("pp_ok", True) else "—",
+                ("%.1f" % t["tg"]) if t.get("tg_ok", True) else "—",
+                t["ttft"], dr, hb, t["zone"])
+            ui.aw(y + 2 + i, 2, row, zc)
+        y += table_h
+
+    # ---- context graph ----
+    # autoscaled: the serving window (262k) dwarfs real usage, so scaling to
+    # n_ctx drew a permanently flat line along the bottom.
+    ui.box(y, 0, gh, W, "Context over turns  tokens", "gry")
+    rows, _ = graph_rows(s["ctx_hist"], iw, gh - 2, floor=1000.0)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "grn")
+    lbl = _stat_label(s["ctx_hist"][-iw:], "%.0f", 6)
+    ui.aw(y, W - len(lbl) - 2, lbl, "grn", "bold")
+    y += gh
+
+    # ---- prefill graph ----
+    ui.box(y, 0, gh, W, "Prefill throughput  t/s", "gry")
+    rows, _ = graph_rows(s["pp_hist"], iw, gh - 2, floor=PP_FULL)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "mag")
+    lbl = _stat_label(s["pp_hist"][-iw:], "%.0f", 4)
+    ui.aw(y, W - len(lbl) - 2, lbl, "mag", "bold")
+    y += gh
+
+    # ---- gen graph ----
+    ui.box(y, 0, gh, W, "Generation throughput  t/s", "gry")
+    rows, _ = graph_rows(s["tg_hist"], iw, gh - 2, floor=TG_FULL)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "cyn")
+    lbl = _stat_label(s["tg_hist"][-iw:], "%.1f", 5)
+    ui.aw(y, W - len(lbl) - 2, lbl, "cyn", "bold")
+    y += gh
+
+    # ---- footer ----
+    apv, atv = recent_averages(s["turns"])
+    hpct = (100.0 * s["s_reuse"] / s["s_prompt"]) if s["s_prompt"] else 0
+    foot = ("q quit  p pause  x clear  c theme:%s  b bg:%s   │   %d turns · "
+            "%s gen tok · avg pp %.0f · avg gen %.1f · cache hit %.0f%% · "
+            "%d evictions") % (
+        ui.theme_name or "-", ui.bg_name or "-",
+        s["s_turns"], human_k(s["s_gen"]), apv, atv, hpct, s["s_evict"])
+    if s["s_errors"]:
+        foot += " · %d errors" % s["s_errors"]
+    ui.aw(H - 1, 0, foot[:W - 1], "blu")
+
+    scr.noutrefresh()
+
+
+def recent_averages(turns, n=20):
+    """Token-weighted (total tokens / total time) prefill and gen rates over
+    the last n usable turns. A plain mean of per-turn rates lets one tiny
+    turn count as much as a 30k-token prompt."""
+    last = list(turns)[:n]
+    pt = sum(t.get("pp_tok", 0) for t in last if t.get("pp_stat"))
+    pm = sum(t.get("pp_ms", 0.0) for t in last if t.get("pp_stat"))
+    gt = sum(t.get("tg_tok", 0) for t in last if t.get("tg_ok"))
+    gm = sum(t.get("tg_ms", 0.0) for t in last if t.get("tg_ok"))
+    return (1000.0 * pt / pm if pm else 0.0, 1000.0 * gt / gm if gm else 0.0)
+
+
+def _snapshot(stt):
+    """Copy the fields draw() needs, under lock, into a plain dict."""
+    slots = stt.busy_slots()
+    return dict(
+        start=stt.start, status=stt.status(slots), version=stt.version,
+        model=stt.model, n_ctx=stt.n_ctx, n_slots=stt.n_slots,
+        last_ctx=stt.last_ctx, last_error=stt.last_error,
+        slots=list(slots.values()),
+        pp_rate=stt.pp_rate, tg_rate=stt.tg_rate, ttft=stt.ttft,
+        draft=stt.draft, hit=stt.hit,
+        pp_hist=list(stt.pp_hist), tg_hist=list(stt.tg_hist),
+        ctx_hist=list(stt.ctx_hist), turns=list(stt.turns),
+        s_turns=stt.s_turns, s_gen=stt.s_gen, s_prefill=stt.s_prefill,
+        s_prompt=stt.s_prompt, s_reuse=stt.s_reuse, s_evict=stt.s_evict,
+        s_cancel=stt.s_cancel, s_errors=stt.s_errors)
+
+
+def run(scr, args):
+    import curses
+    curses.curs_set(0)
+    scr.nodelay(True)
+    ui = UI(scr, not args.no_color)
+
+    stt = State(args.ctx_max)
+    stop = threading.Event()
+    th = threading.Thread(target=tail_thread,
+                          args=(args.path, stt, args.from_start, args.tail, stop,
+                                args.server or None),
+                          daemon=True)
+    th.start()
+    if args.server:
+        threading.Thread(target=poll_slots, args=(args.server, stt, stop),
+                         daemon=True).start()
+
+    paused = False
+    try:
+        while True:
+            if not paused:
+                draw(ui, stt, paused)
+                curses.doupdate()
+            ch = scr.getch()
+            if ch in (ord("q"), ord("Q"), 27):
+                break
+            elif ch in (ord("p"), ord("P")):
+                paused = not paused
+                if paused:
+                    draw(ui, stt, paused)
+                    curses.doupdate()
+            elif ch in (ord("c"), ord("C")):
+                ui.cycle_theme(-1 if ch == ord("C") else 1)
+                draw(ui, stt, paused)
+                curses.doupdate()
+            elif ch in (ord("b"), ord("B")):
+                ui.cycle_bg(-1 if ch == ord("B") else 1)
+                draw(ui, stt, paused)
+                curses.doupdate()
+            elif ch in (ord("x"), ord("X")):
+                with stt.lock:
+                    stt.turns.clear()
+                    stt.pp_hist.clear()
+                    stt.tg_hist.clear()
+                    stt.ctx_hist.clear()
+                    stt.s_turns = stt.s_gen = stt.s_prefill = 0
+                    stt.s_prompt = stt.s_reuse = stt.s_evict = 0
+                    stt.s_cancel = stt.s_errors = 0
+                    stt.last_error = ""
+            elif ch == curses.KEY_RESIZE:
+                scr.erase()
+            time.sleep(args.interval)
+    finally:
+        stop.set()
+
+
+# ----------------------------------------------------------------------------
+# Self-test (no TTY needed)
+# ----------------------------------------------------------------------------
+
+# Verbatim lines from a real b10621 log, plus pre-b10621 shapes. Fixtures MUST
+# be copied from a live log: hand-written ones kept this suite green while the
+# parser had already stopped matching production lines.
+SAMPLES = [
+    "0.00.154.668 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)",
+    "0.00.164.432 I srv    load_model: loading model '/Users/vasilis/Data/AI/Models/Ornith-1.5/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-I-Compact.gguf'",
+    "0.12.677.146 I srv    load_model: loaded multimodal model, '/m/mmproj-Ornith-1.5-35B-A3B-Heretic-MTP-BF16.gguf'",
+    "0.12.721.001 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'",
+    "0.13.011.719 I srv  llama_server: model loaded",
+    "0.13.011.720 I srv  llama_server: listening on http://127.0.0.1:8088",
+    # --- slot 0: a normal, cache-warm turn ---
+    "10768.44.697.967 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.877 (> 0.100 thold), f_keep = 1.000",
+    "10768.44.698.673 I slot launch_slot_: id  0 | task 613580 | processing task, is_child = 0",
+    "10768.49.998.697 I slot print_timing: id  0 | task 613580 | prompt processing, n_tokens =   3124, progress = 0.99, t =   5.30 s / 589.43 tokens per second",
+    "10768.53.845.661 I slot print_timing: id  0 | task 613580 | n_gen =    131, tg =  43.47 t/s, tg_3s =  43.47 t/s",
+    # --- slot 1 interleaves while slot 0 is still generating ---
+    "10768.53.900.000 I slot get_availabl: id  1 | task -1 | selected slot by LRU, t_last = 1169999227453",
+    "2128.44.136.976 W srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 134.543 MiB)",
+    "10768.53.950.000 I slot launch_slot_: id  1 | task 613999 | processing task, is_child = 0",
+    "10768.54.000.000 I slot print_timing: id  1 | task 613999 | prompt processing, n_tokens =   2048, progress = 0.50, t =   2.00 s / 1024.00 tokens per second",
+    # --- slot 0 finishes ---
+    "10769.00.626.239 I slot print_timing: id  0 | task 613580 | prompt eval time =    6133.36 ms /  3394 tokens (    1.81 ms per token,   553.37 tokens per second)",
+    "10769.00.626.241 I slot print_timing: id  0 | task 613580 |        eval time =    9793.95 ms /   421 tokens (   23.26 ms per token,    42.99 tokens per second)",
+    "10769.00.626.241 I slot print_timing: id  0 | task 613580 |       total time =   15927.31 ms /  3815 tokens",
+    "10769.00.626.242 I slot print_timing: id  0 | task 613580 |    graphs reused =     588693",
+    "10769.00.626.244 I slot print_timing: id  0 | task 613580 | draft acceptance = 0.56061 (  222 accepted /   396 generated), mean len =  2.12",
+    "10769.00.628.268 I slot      release: id  0 | task 613580 | stop processing: n_tokens = 28029, truncated = 0",
+    # --- slot 1 finishes: degenerate timings that must not pollute stats ---
+    "10769.01.000.000 I slot print_timing: id  1 | task 613999 | prompt eval time =       1.00 ms /     2 tokens (    0.50 ms per token,  2000.00 tokens per second)",
+    "10769.01.000.001 I slot print_timing: id  1 | task 613999 |        eval time =       0.00 ms /     1 tokens (    0.00 ms per token, 1000000.00 tokens per second)",
+    "10769.01.000.002 I slot      release: id  1 | task 613999 | stop processing: n_tokens = 4096, truncated = 0",
+    # --- slot 2: a real turn where ctx - tg is one BELOW pp, so the naive
+    #     reuse subtraction goes negative and must clamp to zero, not -1 ---
+    "10770.00.000.000 I slot launch_slot_: id  2 | task 614100 | processing task, is_child = 0",
+    "10770.00.100.000 I slot print_timing: id  2 | task 614100 | prompt eval time =    9000.00 ms /  8259 tokens (    1.09 ms per token,   917.667 tokens per second)",
+    "10770.00.100.001 I slot print_timing: id  2 | task 614100 |        eval time =   18000.00 ms /   909 tokens (   19.80 ms per token,    50.50 tokens per second)",
+    "10770.00.100.002 I slot      release: id  2 | task 614100 | stop processing: n_tokens = 9167, truncated = 0",
+    # --- faults ---
+    "9.10.193.379 E ggml_metal_synchronize: error: command buffer 1 failed with status 5",
+    "9.10.193.500 E error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)",
+    # --- pre-b10621 shapes, kept so archived logs still replay ---
+    "0.02.430.393 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 131072",
+    "24.57.383.142 I slot print_timing: id  0 | task 6461 | n_decoded =    101, tg =  26.85 t/s",
+]
+
+SIBLING = "llama-mon"       # the other tool that carries the same shared block
+
+
+def _shared_block(path):
+    try:
+        src = open(path, "r", errors="replace").read()
+    except OSError:
+        return None
+    m = re.search(r"^# ==== BEGIN shared log-grammar block.*?^# ==== END shared"
+                  r" log-grammar block\s*$", src, re.S | re.M)
+    return m.group(0) if m else None
+
+
+def self_test():
+    ok = True
+    stt = State(DEFAULT_CTX_MAX)
+    parsed = 0
+    for ln in SAMPLES:
+        ev = parse_line(ln)
+        assert ev is not None, ln
+        if ev["kind"] != "other":
+            parsed += 1
+        apply_event(stt, ev)
+    print("recognized %d/%d lines" % (parsed, len(SAMPLES)))
+    assert parsed == len(SAMPLES), "some fixture lines fell through to 'other'"
+
+    assert stt.model.startswith("Ornith-1.5"), stt.model
+    assert "mmproj" not in stt.model, stt.model  # main model, not the projector
+    assert stt.n_slots == 4, stt.n_slots
+    assert stt.n_ctx == 131072, stt.n_ctx        # last new_slot line wins
+    assert stt.s_turns == 3, stt.s_turns
+    assert stt.s_evict == 1, stt.s_evict
+    assert stt.s_errors == 2, stt.s_errors       # metal failure + OOM
+
+    # slot 0's turn: real numbers land in the histories
+    t0 = [t for t in stt.turns if t["task"] == 613580][0]
+    assert t0["slot"] == 0 and t0["ctx"] == 28029, t0
+    assert t0["pp_ok"] and t0["tg_ok"], t0
+    # prompt_total 28029-421 = 27608; reuse 27608-3394 = 24214 -> 88%
+    assert abs(t0["hit"] - 24214 / 27608.0) < 1e-9, t0["hit"]
+    # slot 1's degenerate turn is recorded but excluded from rate histories
+    t1 = [t for t in stt.turns if t["task"] == 613999][0]
+    assert t1["slot"] == 1 and not t1["pp_ok"] and not t1["tg_ok"], t1
+    assert t1["evicted"] == 1, t1
+    # slot 1's degenerate rates are excluded; the other two are kept
+    assert list(stt.pp_hist) == [553.37, 917.667], list(stt.pp_hist)
+    assert list(stt.tg_hist) == [42.99, 50.50], list(stt.tg_hist)
+    assert list(stt.ctx_hist) == [28029, 4096, 9167], list(stt.ctx_hist)
+    assert stt.s_prefill == 3394 + 2 + 8259, stt.s_prefill
+    assert stt.s_gen == 421 + 1 + 909, stt.s_gen
+    # the off-by-one turn: 9167 - 909 = 8258, one BELOW its 8259 prefill tokens
+    t2 = [t for t in stt.turns if t["task"] == 614100][0]
+    assert t2["hit"] == 0.0, t2["hit"]          # clamped, never negative
+    # slot 0 reused 24214, slot 1 reused 4093, slot 2's off-by-one contributes
+    # 0 — not -1, which is what an unclamped subtraction would have added
+    assert stt.s_reuse == 24214 + 4093 + 0, stt.s_reuse
+    print("per-slot accounting (3 slots, degenerate + off-by-one turns): ok")
+
+    # concurrency: while slot 0 generates, slot 1 must show as prefilling and
+    # neither may overwrite the other. Replay only up to slot 1's first prefill.
+    stt2 = State(DEFAULT_CTX_MAX)
+    for ln in SAMPLES[:SAMPLES.index(
+            "10768.54.000.000 I slot print_timing: id  1 | task 613999 | prompt "
+            "processing, n_tokens =   2048, progress = 0.50, t =   2.00 s / "
+            "1024.00 tokens per second") + 1]:
+        ev = parse_line(ln)
+        if ev:
+            apply_event(stt2, ev)
+    assert set(stt2.slots) == {0, 1}, stt2.slots
+    assert stt2.slots[0]["phase"] == "GENERATING", stt2.slots[0]
+    assert stt2.slots[0]["task"] == 613580 and stt2.slots[0]["live_gen_n"] == 131
+    assert stt2.slots[1]["phase"] == "PREFILL", stt2.slots[1]
+    # progress 0.50 is over the WHOLE prompt (cached prefix included), and
+    # an LRU pick gives no cache estimate, so the size is honestly unknown
+    assert stt2.slots[1]["task"] == 613999 and stt2.slots[1]["live_pp_total"] is None
+    assert stt2.slots[1]["live_pp_eta"] is None and stt2.slots[1]["live_pp_frac"] == 0.5
+    assert stt2.status() == "GENERATING", stt2.status()
+    print("two slots in flight stay independent: ok")
+
+    # Prefill size from the cache estimate. Real numbers (task 43010): slot
+    # held 60223, f_keep 0.929, true cached prefix 55950, true new tokens 588.
+    st4 = State(DEFAULT_CTX_MAX)
+    st4.slot_ctx[0] = 60223
+    for ln in (
+        "823.09.818.733 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, f_sim_best = 0.990 (> 0.100 thold), f_keep = 0.929",
+        "823.09.819.370 I slot launch_slot_: id  0 | task 43010 | processing task, is_child = 0",
+        "823.12.000.000 I slot print_timing: id  0 | task 43010 | prompt processing, n_tokens =    300, progress = 0.99, t =   2.86 s / 104.90 tokens per second",
+    ):
+        apply_event(st4, parse_line(ln))
+    s4 = st4.slots[0]
+    assert s4["cache_est"] == 55947, s4["cache_est"]
+    assert abs(s4["live_pp_total"] - 588) < 0.02 * 56538, s4["live_pp_total"]
+    # the old n/progress reading would have said ~303 total and ETA ~0s
+    assert s4["live_pp_eta"] > 1.0, s4["live_pp_eta"]
+    # a slot-state restore invalidates the estimate for the next turn
+    apply_event(st4, parse_line("835.43.842.282 I slot load_slot_ch: id  0 | task -1 | restored 4 context checkpoint(s) from '/x.bin'"))
+    st4.slot_ctx[1] = 5
+    assert 0 not in st4.slot_ctx and 1 in st4.slot_ctx, st4.slot_ctx
+
+    # Without an estimate: extrapolate from two lines. 50k cached + 10k new.
+    st5 = State(DEFAULT_CTX_MAX)
+    for ln in (
+        "1.00.000.000 I slot launch_slot_: id  0 | task 7 | processing task, is_child = 0",
+        "1.10.000.000 I slot print_timing: id  0 | task 7 | prompt processing, n_tokens =   1000, progress = 0.85, t =   9.00 s / 111.00 tokens per second",
+    ):
+        apply_event(st5, parse_line(ln))
+    assert st5.slots[0]["live_pp_total"] is None    # one line: unknown, not 85%
+    apply_event(st5, parse_line("1.50.000.000 I slot print_timing: id  0 | task 7 | prompt processing, n_tokens =   5200, progress = 0.92, t =  47.00 s / 111.00 tokens per second"))
+    assert abs(st5.slots[0]["live_pp_total"] - 10000) < 400, st5.slots[0]["live_pp_total"]
+    assert abs(st5.slots[0]["live_pp_eta"] - 4800 / 111.0) < 5, st5.slots[0]["live_pp_eta"]
+    print("prefill size/ETA from whole-prompt progress: ok")
+
+    # /slots, when fresh, decides what is busy and supplies the exact cached
+    # prefix. Numbers from a live probe on this build (task 44973, cold 8890-
+    # token prompt): n_prompt_tokens grows per 2048 chunk and is NOT the
+    # prompt size -- reading it as one called the turn done after chunk 1.
+    st6 = State(DEFAULT_CTX_MAX)
+    st6.phase = "READY"
+    apply_event(st6, parse_line("1.00.000.000 I slot launch_slot_: id  3 | task 9 | processing task, is_child = 0"))
+    for ln in (
+        "860.07.027.890 I slot launch_slot_: id  0 | task 44973 | processing task, is_child = 0",
+        "860.17.795.403 I slot print_timing: id  0 | task 44973 | prompt processing, n_tokens =   2048, progress = 0.23, t =   5.38 s / 380.84 tokens per second",
+    ):
+        apply_event(st6, parse_line(ln))
+    st6.live = {0: dict(proc=True, task=44973, P=4096, C=0, done=2048, dec=0, tg=None)}
+    st6.live_ok, st6.live_ts = True, time.time()
+    b = st6.busy_slots()
+    assert set(b) == {0}, b                       # slot 3 not processing -> gone
+    assert b[0]["phase"] == "PREFILL", b[0]        # NOT done after chunk 1
+    assert abs(b[0]["live_pp_total"] - 8890) < 0.03 * 8890, b[0]["live_pp_total"]
+    assert b[0]["live_ctx"] == 4096, b[0]["live_ctx"]
+    # warm follow-up (task 45214): exact cache from /slots, 12 new tokens
+    st6.live = {0: dict(proc=True, task=45214, P=8910, C=8886, done=12, dec=9, tg=28.0)}
+    b = st6.busy_slots()
+    assert b[0]["phase"] == "GENERATING" and b[0]["live_ctx"] == 8910, b[0]
+    assert st6.status() == "GENERATING"
+    st6.live_ts -= LIVE_FRESH + 1                 # stale sample -> log view
+    assert set(st6.busy_slots()) == {0, 3}
+    assert _parse_slots([{"id": 0, "is_processing": True, "id_task": 5,
+                          "n_prompt_tokens": 10, "n_prompt_tokens_cache": 4,
+                          "n_prompt_tokens_processed": 3,
+                          "next_token": [{"n_decoded": 2}]}])[0] == dict(
+        proc=True, task=5, P=10, C=4, done=3, dec=2)
+    print("/slots overrides log when fresh, yields when stale: ok")
+
+    # averages are token-weighted: 10 tok in 1s must not equal 10k tok in 10s
+    apv, _ = recent_averages([
+        dict(pp_stat=True, pp_tok=10000, pp_ms=10000.0, tg_ok=False),
+        dict(pp_stat=True, pp_tok=100, pp_ms=1000.0, tg_ok=False)])
+    assert abs(apv - 10100 / 11.0) < 1e-6, apv
+    print("token-weighted averages: ok")
+
+    # A slot cut off mid-turn (log rotated, server killed) never gets its
+    # release line and must stop being reported as busy.
+    stt3 = State(DEFAULT_CTX_MAX)
+    for ln in SAMPLES:
+        ev = parse_line(ln)
+        if ev and ev["kind"] != "release":         # every turn left in flight
+            apply_event(stt3, ev)
+    assert set(stt3.slots) == {0, 1, 2}, stt3.slots
+    assert stt3.status() != "IDLE", stt3.status()
+    for sl in stt3.slots.values():                 # age them past the cutoff
+        sl["last_seen"] -= STALE_SLOT_SECS + 1
+    assert stt3.status() == "IDLE", stt3.status()
+    assert stt3.slots == {}, stt3.slots
+    print("stale slots stop being reported as busy: ok")
+
+    rows, mx = graph_rows([10, 20, 40], width=3, height=2, floor=1.0)
+    assert len(rows) == 2 and all(len(r) == 3 for r in rows), rows
+    assert mx == 40
+    # The zone label must agree with the fullness gauge printed beside it.
+    # 27.9k of a 262k window is 11% full and must never read as "long".
+    assert ctx_zone(27900, 262144) == "short", ctx_zone(27900, 262144)
+    assert ctx_zone(8000, 32768) == "medium", ctx_zone(8000, 32768)
+    assert ctx_zone(28029, 65536) == "long", ctx_zone(28029, 65536)
+    assert ctx_zone(28029, 40000) == "very-long", ctx_zone(28029, 40000)
+    assert ctx_zone(28029, 32768) == "extreme", ctx_zone(28029, 32768)
+    assert ctx_zone(1000, 0) == "short"                  # no window known yet
+    # the recorded turn used the real window, so it is nowhere near full
+    assert t0["zone"] == "short", t0["zone"]
+    # Throughput expectations stay keyed on ABSOLUTE context.
+    assert expected_rates(4000) == (1050, 78), expected_rates(4000)
+    assert expected_rates(28029) == (715, 61), expected_rates(28029)
+    assert expected_rates(200000) == (300, 35), expected_rates(200000)
+    print("fullness zones scale to the window; speed bands stay absolute: ok")
+
+    for themes, bgs, lim in ((THEMES, BACKGROUNDS, 256),
+                             (THEMES_BASIC, BACKGROUNDS_BASIC, 8)):
+        for th in themes:
+            for bg_name, bg in bgs:
+                c = compose(th, bg, lim)
+                trio = {c["grn"], c["mag"], c["cyn"]}
+                assert len(trio) == 3 and bg not in trio, (th["name"], bg_name)
+                assert all(0 <= v < lim for v in c.values()
+                           if isinstance(v, int) and v != -1), (th["name"], lim)
+    print("themes: ctx/prefill/gen colors distinct on every background")
+
+    # the sibling tool must carry a byte-identical grammar -----------------
+    mine = _shared_block(os.path.realpath(__file__))
+    sib_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), SIBLING)
+    theirs = _shared_block(sib_path)
+    if mine is None:
+        print("shared block: FAIL (not found in this file)")
+        ok = False
+    elif theirs is None:
+        print("shared block: sibling %s not found — skipped" % SIBLING)
+    elif mine != theirs:
+        print("shared block: FAIL — %s has drifted out of sync" % SIBLING)
+        ok = False
+    else:
+        print("shared block: identical in %s: ok" % SIBLING)
+
+    print("graph rows:")
+    for r in rows:
+        print("  |%s|" % r)
+    print("ALL PASS" if ok else "SOME FAILED")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="btop-style llama-server log dashboard")
+    ap.add_argument("path", nargs="?", default=DEFAULT_LOG)
+    ap.add_argument("--from-start", action="store_true",
+                    help="seed graphs/stats from the whole file")
+    ap.add_argument("--tail", type=int, default=4000, metavar="N",
+                    help="seed from the last N lines (default 4000; 0 = none)")
+    ap.add_argument("--ctx-max", type=int, default=DEFAULT_CTX_MAX,
+                    help="fallback context window if it cannot be detected")
+    ap.add_argument("--server", default=DEFAULT_SERVER, metavar="URL",
+                    help="llama-server URL for /props (build, context window); "
+                         "'' disables")
+    ap.add_argument("--interval", type=float, default=0.2,
+                    help="redraw cadence in seconds (default 0.2)")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--audit", action="store_true",
+                    help="report parser coverage over the log, then exit")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+    if args.audit:
+        return audit_log(args.path)
+    if not sys.stdout.isatty():
+        sys.stderr.write("llama-top needs an interactive terminal "
+                         "(use --self-test to validate logic headlessly).\n")
+        return 2
+
+    locale.setlocale(locale.LC_ALL, "")
+    import curses
+    try:
+        curses.wrapper(run, args)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

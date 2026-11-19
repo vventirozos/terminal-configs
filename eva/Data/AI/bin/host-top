@@ -1,0 +1,2108 @@
+#!/usr/bin/env python3
+"""
+host-top — a btop/htop-style live dashboard for a fleet of hosts over ssh.
+
+Full-screen curses UI that watches several machines at once and shows, all
+refreshing in place:
+  • CPU / GPU / MEM gauges per host, each host in its own color
+  • the whole panel — border, bars, graphs, every label — turning red while
+    that host's cpu or gpu sits at 90% or more. Nothing else warns: these
+    boxes run models, so busy cpus and near-full memory are the normal state
+    and only the gpu carries a graded green/yellow/red band
+  • a per-core utilization strip, load averages, swap, temperatures
+  • scrolling area graphs of cpu / gpu / mem over time, fixed 0–100% scale
+  • link state per host (live, connecting, retrying, stalled)
+
+Each host runs a small agent — the block between the BEGIN/END agent markers
+in this very file — piped to its python3 over one persistent ssh connection.
+Nothing is installed on the remote side and nothing but stdlib is imported, so
+the agent runs on anything with python3 >= 3.6. Samples come back as one JSON
+line per interval; the ssh pipe is the only thing on the wire, which is why
+this stays smooth at a 1s cadence where a poll-per-sample loop would not.
+
+Metrics per platform:
+  macOS   cpu  host_processor_info() tick deltas (per core, like top)
+          gpu  ioreg IOAccelerator "Device Utilization %"
+          mem  vm_stat: (active + wired + compressed) pages
+          temp AppleSMC keys over IOKit (Tp*/Te* cpu, Tg* gpu), mean of
+               each group as mactop computes it; falls back to the IOHID
+               sensor services (M1 on macOS < 14) — both via ctypes, no root
+  Linux   cpu  /proc/stat tick deltas (per core)
+          gpu  nvgpu /sys/.../load (per-mille, Jetson), amdgpu
+               gpu_busy_percent, or nvidia-smi as a last resort
+          mem  /proc/meminfo: MemTotal - MemAvailable
+          temp /sys/class/thermal zones named for the cpu, gpu or junction
+
+Usage:
+    host-top                        # the default fleet: eva nova ghost disorder
+    host-top eva nova ghost webbox
+    host-top --interval 0.5         # sample cadence in seconds (default 1.0)
+    host-top --all-ssh              # don't shortcut the local host
+    host-top --python /usr/bin/python3
+    host-top --no-color
+    host-top --once                 # one JSON sample per host, then exit
+    host-top --self-test            # exercise parsers/layout without a TTY
+
+Keys:  q / Esc quit   ·   c cycle color theme (C reverse)   ·   b cycle
+       background (B reverse)   ·   r reconnect all   ·   p pause
+"""
+
+# ----------------------------------------------------------------------------
+# BEGIN agent block
+#
+# Everything between the BEGIN/END markers is what gets piped to the remote
+# python3 (see agent_source()). It must stay self-contained: stdlib only, no
+# f-strings or anything else younger than 3.6, and no reference to a name
+# defined below the END marker. --self-test compiles the extracted text in
+# isolation, which is what catches a stray reference before a host does.
+# ----------------------------------------------------------------------------
+AGENT_VERSION = "2"
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def _sh(cmd):
+    """Run a /bin/sh command, return stdout as text ('' if it fails)."""
+    try:
+        p = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        out, _ = p.communicate()
+        return out.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _read(path, default=""):
+    try:
+        f = open(path)
+        try:
+            return f.read()
+        finally:
+            f.close()
+    except Exception:
+        return default
+
+
+def _num(s, default=None):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---- parsers, kept separate from the probes so --self-test can drive them ---
+
+def parse_vm_stat(text):
+    """vm_stat output -> (pages dict, page size in bytes)."""
+    psz = 4096
+    m = re.search(r"page size of (\d+) bytes", text)
+    if m:
+        psz = int(m.group(1))
+    pages = {}
+    for line in text.splitlines():
+        m = re.match(r"^(.+?):\s+(\d+)\.?\s*$", line)
+        if m:
+            pages[m.group(1).strip().lower()] = int(m.group(2))
+    return pages, psz
+
+
+def mac_mem(text):
+    """(used, total-ish) bytes from vm_stat. 'Used' follows Activity Monitor:
+    active + wired + compressed. The page sum is only a floor for total — the
+    caller overrides it with hw.memsize, which is the real number."""
+    pages, psz = parse_vm_stat(text)
+    if not pages:
+        return None, None
+    def g(k):
+        return pages.get(k, 0)
+    used = g("pages active") + g("pages wired down") + \
+        g("pages occupied by compressor")
+    total = used + g("pages free") + g("pages inactive") + \
+        g("pages speculative")
+    return used * psz, total * psz
+
+
+def parse_swapusage(text):
+    """sysctl vm.swapusage -> (used, total) bytes."""
+    vals = {}
+    for k, v, u in re.findall(r"(\w+) = ([\d.]+)([MGK])", text):
+        mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[u]
+        vals[k] = float(v) * mult
+    if "total" not in vals:
+        return None, None
+    return vals.get("used", 0.0), vals["total"]
+
+
+def parse_ioreg(text):
+    """IOAccelerator dump -> (utilization %, bytes of system memory in use,
+    gpu core count). Several accelerators can be present; the busiest wins.
+    Cores come from "gpu-core-count", the enabled count System Information
+    shows. "num_cores" in GPUConfigurationVariable is the full die layout, so
+    a binned chip over-reads (an M4 Max 32-core says 40); it is only the
+    fallback for a macOS that lacks the first key."""
+    def mx(pat):
+        vals = [int(v) for v in re.findall(pat, text)]
+        return max(vals) if vals else None
+    cores = mx(r'"gpu-core-count"\s*=\s*(\d+)')
+    if cores is None:
+        cores = mx(r'"num_cores"=(\d+)')
+    return (mx(r'"Device Utilization %"=(\d+)'),
+            mx(r'"In use system memory"=(\d+)'),
+            cores)
+
+
+def parse_proc_stat(text):
+    """/proc/stat -> list of per-cpu tick lists, cpu0 first (aggregate line
+    dropped — we sum the cores ourselves so both numbers agree)."""
+    cores = []
+    for line in text.splitlines():
+        m = re.match(r"^cpu(\d+)\s+(.*)$", line)
+        if m:
+            cores.append([int(x) for x in m.group(2).split()])
+    return cores
+
+
+def parse_meminfo(text):
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^(\w+):\s+(\d+) kB", line)
+        if m:
+            out[m.group(1)] = int(m.group(2)) * 1024
+    return out
+
+
+def cpu_from_ticks(prev, cur, idle_idx):
+    """Tick lists at two instants -> (total busy %, per-core busy %). Counters
+    are unsigned and can wrap (32-bit on Darwin), so deltas are masked; a core
+    that reports no elapsed ticks reads 0 rather than dividing by zero."""
+    if not prev or len(prev) != len(cur):
+        return None, []
+    per = []
+    busy_t = tot_t = 0
+    for a, b in zip(prev, cur):
+        if len(a) != len(b):
+            return None, []
+        d = [(y - x) & 0xFFFFFFFF for x, y in zip(a, b)]
+        tot = sum(d)
+        # Linux: iowait/steal are not idle CPU but they are not busy either;
+        # counting only the idle column matches what top reports.
+        idle = d[idle_idx] if idle_idx < len(d) else 0
+        busy_t += tot - idle
+        tot_t += tot
+        per.append(100.0 * (tot - idle) / tot if tot else 0.0)
+    return (100.0 * busy_t / tot_t if tot_t else 0.0), per
+
+
+# ---- macOS temperatures ----------------------------------------------------
+#
+# Apple Silicon has no /sys/class/thermal and powermetrics wants root, but
+# two unprivileged IOKit doors reach the die sensors. Both are driven through
+# ctypes so the agent stays stdlib-only and fork-free:
+#   SMCTemps  the AppleSMC user client — the way macmon / Stats do it on
+#             macOS 14+. Hundreds of 'flt ' keys whose 4-char names are the
+#             only documentation: Tp*/Te* sit on the cpu clusters, Tg* on
+#             the gpu. Each group reports the mean of its sensors, the same
+#             way mactop gets its cpu/gpu temps, so the two agree. A max was
+#             tried and dropped: each P-core carries a hot-spot key that
+#             reads 25-35°C over its neighbours (~100°C on an M4 Max with
+#             one busy core while the package sits at 65°C and the fans
+#             idle). Ts* is left out like mactop does on chips with no
+#             S-cores. A power-gated sensor returns -4.5 / 0.8 and is cut by
+#             the 10..150 window. Unused slots read exactly 40.0 (an M4 Max
+#             swaps ~45 of them between P-core banks); mactop averages those
+#             in, along with a 64-key cap, and its cpu figure jumps ~20°C
+#             when the banks swap. Here they are dropped, which matches
+#             mactop's reading whenever its cap happens to miss them.
+#   HIDTemps  the IOHIDEventSystem temperature services. Older macOS on M1
+#             labels these ("pACC MTR Temp Sensor", "GPU MTR Temp Sensor");
+#             M2 and later only expose anonymous "PMU tdie" names, which is
+#             why the SMC comes first and this is the fallback.
+
+def _valid_temp(v):
+    return v is not None and 10.0 < v < 150.0
+
+
+SMC_PLACEHOLDER = 40.0
+
+
+def _mean_temps(groups):
+    """{name: [readings]} -> {name: mean of valid readings}, empty groups
+    dropped. Readings of exactly SMC_PLACEHOLDER are unused SMC slots."""
+    out = {}
+    for name, vals in groups.items():
+        vals = [v for v in vals if _valid_temp(v) and v != SMC_PLACEHOLDER]
+        if vals:
+            out[name] = sum(vals) / len(vals)
+    return out
+
+
+class SMCTemps(object):
+    GROUPS = {"Tp": "cpu", "Te": "cpu", "Tg": "gpu"}
+    KERNEL_INDEX = 2
+    READ_KEY, KEY_FROM_INDEX, KEY_INFO = 5, 8, 9
+
+    def __init__(self):
+        import ctypes
+        import struct
+        self._ct, self._st = ctypes, struct
+        u8, u16, u32 = ctypes.c_uint8, ctypes.c_uint16, ctypes.c_uint32
+
+        class Vers(ctypes.Structure):
+            _fields_ = [("major", u8), ("minor", u8), ("build", u8),
+                        ("reserved", u8), ("release", u16)]
+
+        class PLimit(ctypes.Structure):
+            _fields_ = [("version", u16), ("length", u16), ("cpu", u32),
+                        ("gpu", u32), ("mem", u32)]
+
+        class KeyInfo(ctypes.Structure):
+            _fields_ = [("size", u32), ("type", u32), ("attrs", u8)]
+
+        class KeyData(ctypes.Structure):           # SMCKeyData_t, 80 bytes
+            _fields_ = [("key", u32), ("vers", Vers), ("plimit", PLimit),
+                        ("info", KeyInfo), ("result", u8), ("status", u8),
+                        ("data8", u8), ("data32", u32), ("bytes", u8 * 32)]
+
+        if ctypes.sizeof(KeyData) != 80:
+            raise OSError("SMCKeyData_t packed to %d bytes"
+                          % ctypes.sizeof(KeyData))
+        self._KeyData = KeyData
+        io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        io.IOServiceMatching.restype = ctypes.c_void_p
+        io.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        io.IOServiceGetMatchingService.restype = u32
+        io.IOServiceGetMatchingService.argtypes = [u32, ctypes.c_void_p]
+        io.IOServiceOpen.restype = ctypes.c_int
+        io.IOServiceOpen.argtypes = [u32, u32, u32, ctypes.POINTER(u32)]
+        io.IOConnectCallStructMethod.restype = ctypes.c_int
+        io.IOConnectCallStructMethod.argtypes = [
+            u32, u32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t)]
+        libc = ctypes.CDLL(None)
+        libc.mach_task_self.restype = u32
+        svc = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+        if not svc:
+            raise OSError("no AppleSMC service")
+        conn = u32(0)
+        rc = io.IOServiceOpen(svc, libc.mach_task_self(), 0, ctypes.byref(conn))
+        if rc != 0:
+            raise OSError("IOServiceOpen(AppleSMC) = %d" % rc)
+        self._io, self._conn = io, conn.value
+        # one pass over the key table at startup; per sample only the
+        # chosen keys are read, ~0.2ms each
+        self.keys = []                             # [(group, key_u32, size)]
+        count = self._read_u32("#KEY") or 0
+        for idx in range(count):
+            q = KeyData()
+            q.data8, q.data32 = self.KEY_FROM_INDEX, idx
+            r = self._call(q)
+            if r is None:
+                continue
+            name = struct.pack(">I", r.key).decode("latin-1")
+            group = self.GROUPS.get(name[:2])
+            if not group:
+                continue
+            info = self._info(r.key)
+            if info and info[1] == b"flt " and info[0] == 4:
+                self.keys.append((group, r.key, 4))
+
+    def _call(self, q):
+        ctypes = self._ct
+        out = self._KeyData()
+        n = ctypes.c_size_t(ctypes.sizeof(out))
+        rc = self._io.IOConnectCallStructMethod(
+            self._conn, self.KERNEL_INDEX, ctypes.byref(q), ctypes.sizeof(q),
+            ctypes.byref(out), ctypes.byref(n))
+        if rc != 0 or out.result != 0:
+            return None
+        return out
+
+    def _info(self, key):
+        q = self._KeyData()
+        q.key, q.data8 = key, self.KEY_INFO
+        r = self._call(q)
+        if r is None:
+            return None
+        return r.info.size, self._st.pack(">I", r.info.type)
+
+    def _raw(self, key, size):
+        q = self._KeyData()
+        q.key, q.data8, q.info.size = key, self.READ_KEY, size
+        r = self._call(q)
+        return bytes(bytearray(r.bytes[:size])) if r is not None else None
+
+    def _read_u32(self, name):
+        key = self._st.unpack(">I", name.encode("latin-1"))[0]
+        info = self._info(key)
+        if not info or info[0] != 4:
+            return None
+        raw = self._raw(key, 4)
+        return self._st.unpack(">I", raw)[0] if raw else None
+
+    def read(self):
+        groups = {}
+        for group, key, size in self.keys:
+            raw = self._raw(key, size)
+            if raw:
+                groups.setdefault(group, []).append(
+                    self._st.unpack("<f", raw)[0])
+        return _mean_temps(groups)
+
+
+class HIDTemps(object):
+    LABELS = (("pACC MTR Temp Sensor", "cpu"), ("eACC MTR Temp Sensor", "cpu"),
+              ("GPU MTR Temp Sensor", "gpu"))
+    USAGE_PAGE_APPLE_VENDOR, USAGE_TEMPERATURE = 0xff00, 5
+    EVENT_TEMPERATURE = 15
+
+    def __init__(self):
+        import ctypes
+        self._ct = ctypes
+        P = ctypes.c_void_p
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/"
+                         "CoreFoundation")
+        io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        cf.CFStringCreateWithCString.restype = P
+        cf.CFStringCreateWithCString.argtypes = [P, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFNumberCreate.restype = P
+        cf.CFNumberCreate.argtypes = [P, ctypes.c_int, P]
+        cf.CFDictionaryCreate.restype = P
+        cf.CFDictionaryCreate.argtypes = [P, P, P, ctypes.c_long, P, P]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetCount.argtypes = [P]
+        cf.CFArrayGetValueAtIndex.restype = P
+        cf.CFArrayGetValueAtIndex.argtypes = [P, ctypes.c_long]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [P, ctypes.c_char_p, ctypes.c_long,
+                                          ctypes.c_uint32]
+        cf.CFRelease.argtypes = [P]
+        io.IOHIDEventSystemClientCreate.restype = P
+        io.IOHIDEventSystemClientCreate.argtypes = [P]
+        io.IOHIDEventSystemClientSetMatching.argtypes = [P, P]
+        io.IOHIDEventSystemClientCopyServices.restype = P
+        io.IOHIDEventSystemClientCopyServices.argtypes = [P]
+        io.IOHIDServiceClientCopyProperty.restype = P
+        io.IOHIDServiceClientCopyProperty.argtypes = [P, P]
+        io.IOHIDServiceClientCopyEvent.restype = P
+        io.IOHIDServiceClientCopyEvent.argtypes = [P, ctypes.c_int64,
+                                                   ctypes.c_int32, ctypes.c_int64]
+        io.IOHIDEventGetFloatValue.restype = ctypes.c_double
+        io.IOHIDEventGetFloatValue.argtypes = [P, ctypes.c_int32]
+        self._cf, self._io = cf, io
+        UTF8 = 0x08000100
+
+        def cfstr(s):
+            return cf.CFStringCreateWithCString(None, s.encode(), UTF8)
+
+        def cfnum(v):
+            c = ctypes.c_int32(v)
+            return cf.CFNumberCreate(None, 3, ctypes.byref(c))   # kCFNumberSInt32Type
+
+        keys = (P * 2)(cfstr("PrimaryUsagePage"), cfstr("PrimaryUsage"))
+        vals = (P * 2)(cfnum(self.USAGE_PAGE_APPLE_VENDOR),
+                       cfnum(self.USAGE_TEMPERATURE))
+        kcb = P.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+        vcb = P.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+        match = cf.CFDictionaryCreate(None, keys, vals, 2, ctypes.byref(kcb),
+                                      ctypes.byref(vcb))
+        self._client = io.IOHIDEventSystemClientCreate(None)
+        if not self._client:
+            raise OSError("IOHIDEventSystemClientCreate failed")
+        io.IOHIDEventSystemClientSetMatching(self._client, match)
+        self._services = io.IOHIDEventSystemClientCopyServices(self._client)
+        self.keys = []                             # [(group, service)]
+        if not self._services:
+            return
+        prod = cfstr("Product")
+        buf = ctypes.create_string_buffer(256)
+        for i in range(cf.CFArrayGetCount(self._services)):
+            svc = cf.CFArrayGetValueAtIndex(self._services, i)
+            name = io.IOHIDServiceClientCopyProperty(svc, prod)
+            if not name:
+                continue
+            label = (buf.value.decode("utf-8", "replace")
+                     if cf.CFStringGetCString(name, buf, 256, UTF8) else "")
+            cf.CFRelease(name)
+            for prefix, group in self.LABELS:
+                if label.startswith(prefix):
+                    self.keys.append((group, svc))
+
+    def read(self):
+        groups = {}
+        for group, svc in self.keys:
+            ev = self._io.IOHIDServiceClientCopyEvent(
+                svc, self.EVENT_TEMPERATURE, 0, 0)
+            if not ev:
+                continue
+            v = self._io.IOHIDEventGetFloatValue(ev, self.EVENT_TEMPERATURE << 16)
+            self._cf.CFRelease(ev)
+            groups.setdefault(group, []).append(v)
+        return _mean_temps(groups)
+
+
+def find_mac_temps():
+    """The first sensor source that actually has cpu/gpu keys, or None. A
+    failure here must never cost a sample, so everything is swallowed."""
+    for cls in (SMCTemps, HIDTemps):
+        try:
+            src = cls()
+            if src.keys:
+                return src
+        except Exception:
+            pass
+    return None
+
+
+# ---- probes -----------------------------------------------------------------
+
+class DarwinProbe(object):
+    """macOS. CPU comes from mach directly (no subprocess); gpu/mem/swap ride
+    in one /bin/sh call per tick so a sample costs one fork, not three."""
+
+    SAMPLE_SH = ("ioreg -r -d 1 -w 0 -c IOAccelerator 2>/dev/null; echo '@@'; "
+                 "vm_stat 2>/dev/null; echo '@@'; "
+                 "sysctl -n vm.swapusage 2>/dev/null")
+
+    def __init__(self):
+        self._prev = None
+        self._memtotal = None
+        self._mach = False
+        self._temps = find_mac_temps()
+        try:
+            import ctypes
+            import ctypes.util
+            self._ct = ctypes
+            self._libc = ctypes.CDLL(ctypes.util.find_library("c"),
+                                     use_errno=True)
+            self._libc.mach_host_self.restype = ctypes.c_uint
+            self._libc.vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_void_p,
+                                                 ctypes.c_size_t]
+            self._host = self._libc.mach_host_self()
+            self._task = ctypes.c_uint.in_dll(self._libc,
+                                              "mach_task_self_").value
+            self._ticks()                  # prove it works before relying on it
+            self._mach = True
+        except Exception:
+            self._mach = False
+
+    def _ticks(self):
+        """host_processor_info(PROCESSOR_CPU_LOAD_INFO) -> per-core tick lists
+        of [user, system, idle, nice]. The array is vm_allocate'd for us, so it
+        has to be handed back or every sample leaks a page."""
+        ctypes = self._ct
+        PROCESSOR_CPU_LOAD_INFO, CPU_STATE_MAX = 2, 4
+        ncpu = ctypes.c_uint(0)
+        arr = ctypes.POINTER(ctypes.c_uint)()
+        cnt = ctypes.c_uint(0)
+        rc = self._libc.host_processor_info(
+            self._host, PROCESSOR_CPU_LOAD_INFO, ctypes.byref(ncpu),
+            ctypes.byref(arr), ctypes.byref(cnt))
+        if rc != 0:
+            raise OSError("host_processor_info failed: %d" % rc)
+        try:
+            vals = [arr[i] for i in range(cnt.value)]
+        finally:
+            self._libc.vm_deallocate(
+                self._task, ctypes.cast(arr, ctypes.c_void_p),
+                cnt.value * ctypes.sizeof(ctypes.c_uint))
+        return [vals[i * CPU_STATE_MAX:(i + 1) * CPU_STATE_MAX]
+                for i in range(ncpu.value)]
+
+    def prime(self):
+        if self._mach:
+            try:
+                self._prev = self._ticks()
+            except Exception:
+                self._mach = False
+
+    def static(self):
+        out = _sh("sysctl -n hw.model machdep.cpu.brand_string hw.ncpu "
+                  "hw.memsize kern.boottime").splitlines()
+        info = {"os": "macOS", "arch": os.uname().machine,
+                "host": os.uname().nodename.split(".")[0]}
+        if len(out) >= 4:
+            info["model"] = out[0].strip()
+            info["cpu_model"] = out[1].strip()
+            info["ncpu"] = int(_num(out[2], 0) or 0)
+            info["memtotal"] = int(_num(out[3], 0) or 0)
+            self._memtotal = info["memtotal"] or None
+        m = re.search(r"sec = (\d+)", "\n".join(out[4:]))
+        if m:
+            info["boot"] = int(m.group(1))
+        ver = _sh("sw_vers -productVersion").strip()
+        if ver:
+            info["os"] = "macOS " + ver
+        _, _, cores = parse_ioreg(_sh("ioreg -r -d 1 -w 0 -c IOAccelerator"))
+        if cores:
+            info["gpu_cores"] = cores
+        info["gpu_model"] = info.get("cpu_model", "") + " GPU"
+        return info
+
+    def sample(self):
+        s = {}
+        if self._mach:
+            cur = self._ticks()
+            s["cpu"], s["cores"] = cpu_from_ticks(self._prev, cur, 2)
+            self._prev = cur
+        blob = _sh(self.SAMPLE_SH).split("@@")
+        if len(blob) >= 1:
+            util, gmem, _ = parse_ioreg(blob[0])
+            s["gpu"] = float(util) if util is not None else None
+            s["gpu_mem"] = gmem
+        if len(blob) >= 2:
+            used, total = mac_mem(blob[1])
+            s["mem_used"] = used
+            s["mem_total"] = self._memtotal or total
+        if len(blob) >= 3:
+            s["swap_used"], s["swap_total"] = parse_swapusage(blob[2])
+        if self._temps:
+            try:
+                temps = self._temps.read()
+            except Exception:
+                temps, self._temps = None, None    # one bad read, not every tick
+            if temps:
+                s["temps"] = temps
+        try:
+            s["load"] = list(os.getloadavg())
+        except Exception:
+            pass
+        return s
+
+
+class LinuxProbe(object):
+    """Linux. Everything is a sysfs/procfs read — no subprocess at all unless
+    we had to fall back to nvidia-smi for the GPU."""
+
+    def __init__(self):
+        self._prev = None
+        self._gpu = self._find_gpu()
+        self._zones = self._find_zones()
+        self._freq = self._find_gpu_freq()
+
+    @staticmethod
+    def _glob(pat):
+        import glob as _glob
+        return sorted(_glob.glob(pat))
+
+    def _find_gpu(self):
+        """(kind, path). nvgpu 'load' files are per-mille, amdgpu's
+        gpu_busy_percent is already a percentage; nvidia-smi is last because
+        it costs a fork per sample."""
+        for pat in ("/sys/devices/platform/*.gpu/load",
+                    "/sys/devices/gpu.0/load",
+                    "/sys/class/devfreq/*.gpu/device/load"):
+            for p in self._glob(pat):
+                if _read(p, "").strip().isdigit():
+                    return ("permille", p)
+        for p in self._glob("/sys/class/drm/card*/device/gpu_busy_percent"):
+            if _read(p, "").strip().isdigit():
+                return ("percent", p)
+        if _sh("command -v nvidia-smi").strip():
+            out = _sh("nvidia-smi --query-gpu=utilization.gpu "
+                      "--format=csv,noheader,nounits")
+            if _num(out.strip().splitlines()[0] if out.strip() else "") is not None:
+                return ("nvidia-smi", None)
+        return (None, None)
+
+    def _find_gpu_freq(self):
+        for p in self._glob("/sys/class/devfreq/*.gpu/cur_freq"):
+            return p
+        return None
+
+    def _find_zones(self):
+        """Thermal zones worth a line: the cpu, gpu and junction sensors. Some
+        zones on a Jetson return EAGAIN, so each read stays guarded."""
+        want = ("cpu", "gpu", "tj", "soc0", "package", "k10temp", "cpu_thermal")
+        zones = []
+        for d in self._glob("/sys/class/thermal/thermal_zone*"):
+            name = _read(os.path.join(d, "type")).strip().lower()
+            short = name.replace("-thermal", "").replace("_thermal", "")
+            if any(w in name for w in want):
+                zones.append((short, os.path.join(d, "temp")))
+        return zones[:4]
+
+    def prime(self):
+        self._prev = parse_proc_stat(_read("/proc/stat"))
+
+    def static(self):
+        info = {"os": "Linux", "arch": os.uname().machine,
+                "host": os.uname().nodename.split(".")[0]}
+        rel = _read("/etc/os-release")
+        m = re.search(r'^PRETTY_NAME="?(.*?)"?$', rel, re.M)
+        if m:
+            info["os"] = m.group(1)
+        info["model"] = (_read("/proc/device-tree/model").replace("\0", "").strip()
+                         or _read("/sys/devices/virtual/dmi/id/product_name").strip())
+        cpuinfo = _read("/proc/cpuinfo")
+        m = re.search(r"^(?:model name|Model)\s*:\s*(.+)$", cpuinfo, re.M)
+        if m:
+            info["cpu_model"] = m.group(1).strip()
+        info["ncpu"] = len(parse_proc_stat(_read("/proc/stat")))
+        info["memtotal"] = parse_meminfo(_read("/proc/meminfo")).get("MemTotal")
+        up = _num(_read("/proc/uptime").split()[0] if _read("/proc/uptime") else "")
+        if up:
+            info["boot"] = int(time.time() - up)
+        kind, path = self._gpu
+        if kind == "nvidia-smi":
+            name = _sh("nvidia-smi --query-gpu=name --format=csv,noheader").strip()
+            info["gpu_model"] = name.splitlines()[0] if name else "NVIDIA GPU"
+        elif kind:
+            # a Tegra's only useful GPU name is the board's, trimmed: the
+            # device-tree model runs to "…Developer Kit Super"
+            m = re.search(r"(Jetson(?: \w+){1,2})", info.get("model") or "")
+            info["gpu_model"] = (m.group(1) + " iGPU") if m else "integrated GPU"
+        return info
+
+    def gpu(self):
+        kind, path = self._gpu
+        if kind == "permille":
+            v = _num(_read(path).strip())
+            return v / 10.0 if v is not None else None
+        if kind == "percent":
+            return _num(_read(path).strip())
+        if kind == "nvidia-smi":
+            out = _sh("nvidia-smi --query-gpu=utilization.gpu "
+                      "--format=csv,noheader,nounits").strip()
+            return _num(out.splitlines()[0]) if out else None
+        return None
+
+    def sample(self):
+        s = {}
+        cur = parse_proc_stat(_read("/proc/stat"))
+        s["cpu"], s["cores"] = cpu_from_ticks(self._prev, cur, 3)
+        self._prev = cur
+        mi = parse_meminfo(_read("/proc/meminfo"))
+        if "MemTotal" in mi:
+            avail = mi.get("MemAvailable", mi.get("MemFree", 0))
+            s["mem_total"] = mi["MemTotal"]
+            s["mem_used"] = mi["MemTotal"] - avail
+        if "SwapTotal" in mi:
+            s["swap_total"] = mi["SwapTotal"]
+            s["swap_used"] = mi["SwapTotal"] - mi.get("SwapFree", 0)
+        s["gpu"] = self.gpu()
+        if self._freq:
+            f = _num(_read(self._freq).strip())
+            if f:
+                s["gpu_freq"] = f / 1e6          # MHz
+        temps = {}
+        for short, path in self._zones:
+            v = _num(_read(path).strip())
+            if v is not None:
+                temps[short] = v / 1000.0
+        if temps:
+            s["temps"] = temps
+        try:
+            s["load"] = list(os.getloadavg())
+        except Exception:
+            pass
+        return s
+
+
+def agent_main(interval):
+    probe = DarwinProbe() if sys.platform == "darwin" else LinuxProbe()
+    info = probe.static()
+    info["t"] = "hello"
+    info["agent"] = AGENT_VERSION
+    emit(info)
+    probe.prime()
+    time.sleep(min(0.3, interval))
+    while True:
+        t0 = time.time()
+        try:
+            s = probe.sample()
+        except Exception as e:
+            s = {"err": "%s: %s" % (type(e).__name__, e)}
+        s["t"] = "s"
+        s["ts"] = time.time()
+        emit(s)
+        nap = interval - (time.time() - t0)
+        if nap > 0:
+            time.sleep(nap)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+# ----------------------------------------------------------------------------
+# END agent block
+# ----------------------------------------------------------------------------
+
+import argparse
+import shlex
+import socket
+import threading
+from collections import deque
+
+DEFAULT_HOSTS = ["eva", "nova", "ghost", "disorder"]
+DEFAULT_INTERVAL = 1.0
+REDRAW = 0.25                      # UI cadence; samples arrive on --interval
+HIST = 2048                        # samples kept per metric per host
+STALE_FACTOR = 4.0                 # missed intervals before a host reads stale
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+BEGIN_MARK = "# BEGIN agent block"
+END_MARK = "# END agent block"
+
+
+def agent_source(path=None):
+    """This file's own agent block, plus the line that starts it. Extracting
+    it beats keeping the agent in a string literal — it stays real code that
+    the editor, the linter and --self-test can all see."""
+    src = _read(path or os.path.realpath(__file__))
+    try:
+        body = src.split(BEGIN_MARK, 1)[1].split(END_MARK, 1)[0]
+    except IndexError:
+        raise RuntimeError("agent block markers missing from %s" % __file__)
+    return body + "\n\nagent_main(float(sys.argv[1]) "\
+                  "if len(sys.argv) > 1 else 1.0)\n"
+
+
+# ----------------------------------------------------------------------------
+# Color themes — same rotating schemes as llama-top, dark-leaning 256-color.
+# Here the roles are per-host rather than per-metric: HOST_ROLES is walked in
+# order so host 1/2/3 stay visually distinct, and compose() guarantees that
+# trio never collides with each other or with the background.
+# ----------------------------------------------------------------------------
+
+# Red is reserved for the >=90% alarm, so no host is ever assigned it as an
+# identity color — a calm sixth host must not look pinned. It still takes part
+# in the distinctness check below, or the alarm could land on a host's color.
+HOST_ROLES = ["cyn", "mag", "grn", "blu", "yel"]
+DISTINCT_ROLES = HOST_ROLES + ["red"]
+
+THEMES = [
+    dict(name="classic", grn=2,   mag=5,   cyn=6,   yel=3,   red=1,
+         blu=4,   gry=245, alts=[10, 13, 14]),
+    dict(name="ember",   grn=130, mag=125, cyn=136, yel=180, red=124,
+         blu=95,  gry=101, alts=[166, 208, 88]),
+    dict(name="ocean",   grn=30,  mag=61,  cyn=38,  yel=143, red=167,
+         blu=25,  gry=60,  alts=[45, 105, 24]),
+    dict(name="forest",  grn=28,  mag=100, cyn=37,  yel=136, red=88,
+         blu=65,  gry=102, alts=[34, 71, 22]),
+    dict(name="dusk",    grn=96,  mag=61,  cyn=132, yel=180, red=125,
+         blu=104, gry=59,  alts=[139, 97, 55]),
+    dict(name="1977",    grn=4,   mag=2,   cyn=5,   yel=3,   red=1,
+         blu=208, gry=245, alts=[166, 33, 129]),
+    dict(name="macchiato", grn=150, mag=183, cyn=116, yel=223, red=210,
+         blu=111, gry=146, alts=[147, 218, 216]),
+]
+BACKGROUNDS = [
+    ("default", -1), ("black", 16), ("charcoal", 234),
+    ("navy", 17), ("ink", 53),
+]
+THEMES_BASIC = [
+    dict(name="classic", grn=2, mag=5, cyn=6, yel=3, red=1, blu=4, gry=7,
+         alts=[]),
+]
+BACKGROUNDS_BASIC = [("default", -1), ("black", 0)]
+
+
+def compose(theme, bg, limit=256):
+    """Resolve a theme against a background: the host colors and the alarm
+    red must stay mutually distinct and none of them may match the bg."""
+    out = dict(theme)
+    spare = [c for c in list(theme.get("alts", ())) + [208, 39, 205, 118, 250, 15]
+             if c < limit]
+    used = {bg}
+    for role in DISTINCT_ROLES:
+        c = out[role]
+        while c in used and spare:
+            c = spare.pop(0)
+        used.add(c)
+        out[role] = c
+    for role in ("gry",):
+        while out[role] == bg and spare:
+            out[role] = spare.pop(0)
+    return out
+
+
+ALARM_PCT = 90.0        # cpu or gpu at or above this turns the host red
+ALARM_HOLD = 3          # samples the alarm stays latched after a breach
+
+
+def host_alarm(s, interval):
+    """True while this host's cpu or gpu is pinned. It latches for a few
+    samples so a host sitting right on the line does not strobe red once a
+    second, and it needs a fresh sample — a host that drops off at 95% must
+    not stay red forever on a reading nobody is updating any more."""
+    if s["state"] != "live" or not s["last_ts"]:
+        return False
+    if time.time() - s["last_ts"] > interval * STALE_FACTOR:
+        return False
+    for hist in (s["cpu_h"], s["gpu_h"]):
+        for v in list(hist)[-ALARM_HOLD:]:
+            if v is not None and v >= ALARM_PCT:
+                return True
+    return False
+
+
+# These hosts run models, so cpu and memory sit high all day — a warning band
+# on either is noise you learn to ignore, which is the one thing a warning
+# must never become. Only the GPU gets the graded gradient; cpu and memory
+# read plain until the panel-wide alarm fires and repaints everything red.
+WARN_METRICS = ("GPU",)
+
+
+def zone_color(pct):
+    """Severity of a 0-100 load number, matching llama-top's fill gradient."""
+    if pct is None:
+        return "gry"
+    if pct >= 90:
+        return "red"
+    if pct >= 70:
+        return "yel"
+    return "grn"
+
+
+def value_color(label, pct):
+    """Color for a gauge's number. Graded for the metrics that warn, plain
+    for the ones that are expected to run hot."""
+    if pct is None:
+        return "gry"
+    return zone_color(pct) if label in WARN_METRICS else "grn"
+
+
+_EIGHTHS = " ▏▎▍▌▋▊▉"
+TRACK = "·"
+
+
+def meter(frac, width):
+    """(fill, track) for a bar `width` cells wide. The fill resolves to an
+    eighth of a cell so a 1% move still shows; the track is returned apart
+    so it can be drawn in the chrome color and an empty bar reads as a rail."""
+    frac = max(0.0, min(1.0, frac))
+    full, part = divmod(int(round(frac * width * 8)), 8)
+    fill = "█" * full + (_EIGHTHS[part] if part else "")
+    return fill, TRACK * (width - len(fill))
+
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def cores_strip(cores, width):
+    """One block glyph per core, tallest = busiest. An idle core still draws
+    ▁ rather than a space so the strip's width reads as the core count."""
+    if not cores:
+        return ""
+    out = []
+    for c in cores[:width]:
+        out.append(_BLOCKS[max(1, min(8, int(round((c or 0) / 100.0 * 8))))])
+    return "".join(out)
+
+
+def graph_rows(vals, width, height, maxval=100.0):
+    """Area chart rows, newest sample at the right. Unlike llama-top's
+    autoscaled graphs these are pinned to 0-100% so a spike on one host is
+    the same height as the same spike on another."""
+    vals = [v for v in vals][-width:]
+    if len(vals) < width:
+        vals = [None] * (width - len(vals)) + vals
+    cols = [0 if v is None else int(round((min(v, maxval) / maxval) * height * 8))
+            for v in vals]
+    rows = []
+    for r in range(height):
+        cb = (height - 1 - r) * 8
+        rows.append("".join(
+            "█" if (h - cb) >= 8 else (" " if (h - cb) <= 0 else _BLOCKS[h - cb])
+            for h in cols))
+    return rows
+
+
+def stat_label(win, unit="%", short=False):
+    """' peak X · avg Y · low Z ' for the visible window, padded to sit in
+    the divider line above the graph; short drops the low for a narrow one."""
+    win = [v for v in win if v is not None]
+    if not win:
+        return " no data "
+    if short:
+        return " peak %.0f%s · avg %.0f%s " % (
+            max(win), unit, sum(win) / len(win), unit)
+    return " peak %.0f%s · avg %.0f%s · low %.0f%s " % (
+        max(win), unit, sum(win) / len(win), unit, min(win), unit)
+
+
+def human_bytes(n):
+    if n is None:
+        return "—"
+    for suf, div in (("T", 1024.0 ** 4), ("G", 1024.0 ** 3),
+                     ("M", 1024.0 ** 2), ("K", 1024.0)):
+        if n >= div:
+            v = n / div
+            return ("%.1f%s" if v < 100 else "%.0f%s") % (v, suf)
+    return "%d" % n
+
+
+def human_dur(secs):
+    if secs is None or secs < 0:
+        return "—"
+    secs = int(secs)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return "%dd %dh" % (d, h)
+    if h:
+        return "%dh %dm" % (h, m)
+    return "%dm" % m
+
+
+# ----------------------------------------------------------------------------
+# One Host per machine: shared state written by its reader thread, read by the
+# draw loop. Every field the UI touches lives under the lock.
+# ----------------------------------------------------------------------------
+
+class Host(object):
+    def __init__(self, name, role):
+        self.name = name
+        self.role = role                 # theme color role, fixed per host
+        self.lock = threading.Lock()
+        self.info = {}                   # from the agent's hello line
+        self.last = {}                   # newest sample
+        self.last_ts = 0.0
+        self.state = "connecting"        # connecting | live | retry | error
+        self.detail = ""                 # error text / retry countdown
+        self.samples = 0
+        self.local = False
+        self.cpu_h = deque(maxlen=HIST)
+        self.gpu_h = deque(maxlen=HIST)
+        self.mem_h = deque(maxlen=HIST)
+        self.proc = None
+        self.stop = threading.Event()
+        self.kick = threading.Event()    # 'r' -> drop the link and redial
+
+    def kill_proc(self):
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def set(self, state, detail=""):
+        with self.lock:
+            self.state = state
+            self.detail = detail
+
+    def on_hello(self, msg):
+        with self.lock:
+            self.info = msg
+            self.state = "live"
+            self.detail = ""
+
+    def on_sample(self, msg):
+        with self.lock:
+            self.last = msg
+            self.last_ts = time.time()
+            self.samples += 1
+            self.state = "live"
+            self.detail = ""
+            self.cpu_h.append(msg.get("cpu"))
+            self.gpu_h.append(msg.get("gpu"))
+            mu, mt = msg.get("mem_used"), msg.get("mem_total")
+            self.mem_h.append(100.0 * mu / mt if mu and mt else None)
+
+    def snapshot(self, gw):
+        with self.lock:
+            return dict(
+                name=self.name, role=self.role, info=dict(self.info),
+                last=dict(self.last), last_ts=self.last_ts, state=self.state,
+                detail=self.detail, samples=self.samples, local=self.local,
+                cpu_h=list(self.cpu_h)[-gw:], gpu_h=list(self.gpu_h)[-gw:],
+                mem_h=list(self.mem_h)[-gw:])
+
+
+def is_local(name):
+    """True if this host name is the machine we are running on — then the
+    agent is a plain subprocess and ssh never enters the picture."""
+    me = {socket.gethostname(), socket.gethostname().split(".")[0],
+          os.uname().nodename, os.uname().nodename.split(".")[0]}
+    me = set(x.lower() for x in me if x)
+    return name.split(".")[0].lower() in me
+
+
+def build_cmd(name, args):
+    if not args.all_ssh and is_local(name):
+        return [sys.executable, "-u", "-"], True
+    remote = "%s -u -" % shlex.quote(args.python)
+    return ["ssh"] + SSH_OPTS + ["-T", name, remote], False
+
+
+def pump(host, args, src):
+    """Keep one agent alive on this host: dial, feed it the agent source,
+    read JSON lines until the link dies, then back off and redial. An ssh
+    that drops is normal operating weather here, not an error path."""
+    backoff = 1.0
+    while not host.stop.is_set():
+        cmd, local = build_cmd(host.name, args)
+        with host.lock:
+            host.local = local
+        host.set("connecting", "local" if local else "ssh")
+        errs = deque(maxlen=6)
+        if host.stop.is_set():
+            break
+        try:
+            p = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=1, universal_newlines=True)
+        except Exception as e:
+            host.set("error", "%s: %s" % (type(e).__name__, e))
+            if host.stop.wait(backoff):
+                break
+            backoff = min(15.0, backoff * 2)
+            continue
+        host.proc = p
+        if host.stop.is_set():       # stopped while the child was starting
+            host.kill_proc()
+
+        def drain():
+            for line in p.stderr:
+                line = line.strip()
+                if line:
+                    errs.append(line)
+        te = threading.Thread(target=drain, daemon=True)
+        te.start()
+        try:
+            p.stdin.write(src + "\n")
+            p.stdin.flush()
+            p.stdin.close()               # `python3 -` runs once stdin is EOF
+            for line in p.stdout:
+                if host.stop.is_set() or host.kick.is_set():
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("t") == "hello":
+                    host.on_hello(msg)
+                    backoff = 1.0
+                elif msg.get("t") == "s":
+                    host.on_sample(msg)
+        except Exception as e:
+            errs.append("%s: %s" % (type(e).__name__, e))
+        finally:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                pass
+            host.proc = None
+        if host.stop.is_set():
+            break
+        if host.kick.is_set():       # 'r' — the user asked, so redial at once
+            host.kick.clear()
+            backoff = 1.0
+            continue
+        why = errs[-1] if errs else "link closed"
+        for _ in range(int(backoff * 10)):
+            if host.stop.is_set():
+                break
+            host.set("retry", why)
+            time.sleep(0.1)
+        backoff = min(15.0, backoff * 2)
+
+
+# ----------------------------------------------------------------------------
+# Curses rendering
+# ----------------------------------------------------------------------------
+
+STATE_COLOR = {"live": None, "connecting": "yel", "retry": "red",
+               "error": "red", "stalled": "yel"}
+
+
+class UI(object):
+    def __init__(self, scr, use_color):
+        import curses
+        self.curses = curses
+        self.scr = scr
+        self.color = use_color and curses.has_colors()
+        self.pairs = {}
+        self.theme_i = 0
+        self.bg_i = 0
+        self.many = False
+        self.theme_name = ""
+        self.bg_name = ""
+        if self.color:
+            curses.start_color()
+            curses.use_default_colors()
+            self.many = curses.COLORS >= 256
+            self.apply_colors()
+
+    def apply_colors(self):
+        curses = self.curses
+        themes = THEMES if self.many else THEMES_BASIC
+        bgs = BACKGROUNDS if self.many else BACKGROUNDS_BASIC
+        theme = themes[self.theme_i % len(themes)]
+        bg_name, bg = bgs[self.bg_i % len(bgs)]
+        colors = compose(theme, bg, curses.COLORS)
+        colors["fg"] = -1                        # the terminal's own text color
+        for i, name in enumerate(("grn", "yel", "red", "cyn", "mag", "blu",
+                                  "gry", "fg"), 1):
+            curses.init_pair(i, colors[name], bg)
+            self.pairs[name] = curses.color_pair(i) | (
+                curses.A_DIM if name == "gry" and not self.many else 0)
+        curses.init_pair(9, colors["gry"], bg)   # fills blank cells too
+        self.scr.bkgd(" ", curses.color_pair(9))
+        self.theme_name = theme["name"]
+        self.bg_name = bg_name
+
+    def cycle_theme(self, step=1):
+        if self.color:
+            self.theme_i += step
+            self.apply_colors()
+
+    def cycle_bg(self, step=1):
+        if self.color:
+            self.bg_i += step
+            self.apply_colors()
+
+    def attr(self, *styles):
+        a = 0
+        for s in styles:
+            if s == "bold":
+                a |= self.curses.A_BOLD
+            elif s == "rev":
+                a |= self.curses.A_REVERSE
+            elif s == "dim":
+                a |= self.curses.A_DIM
+            elif self.color and s in self.pairs:
+                a |= self.pairs[s]
+        return a
+
+    def aw(self, y, x, s, *styles):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        if x < 0:
+            s = s[-x:]
+            x = 0
+        s = s[:max(0, w - x)]
+        try:
+            self.scr.addstr(y, x, s, self.attr(*styles))
+        except self.curses.error:
+            pass
+
+    def box(self, y, x, h, w, title="", *styles):
+        if h < 2 or w < 2:
+            return
+        self.aw(y, x, "╭" + "─" * (w - 2) + "╮", *styles)
+        for i in range(1, h - 1):
+            self.aw(y + i, x, "│", *styles)
+            self.aw(y + i, x + w - 1, "│", *styles)
+        self.aw(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", *styles)
+        if title:
+            self.aw(y, x + 2, " " + title + " ", "bold", *styles)
+
+
+def host_title(s):
+    """'eva · macOS 27.0 arm64 · Apple M3 Max · 14 cpu · 20 gpu'"""
+    i = s["info"]
+    bits = [s["name"]]
+    if i.get("os"):
+        bits.append(("%s %s" % (i["os"], i.get("arch", ""))).strip())
+    if i.get("cpu_model"):
+        bits.append(i["cpu_model"])
+    if i.get("ncpu"):
+        bits.append("%d cpu" % i["ncpu"])
+    if i.get("gpu_cores"):
+        bits.append("%d gpu" % i["gpu_cores"])
+    return " · ".join(bits)
+
+
+def host_status(s, interval):
+    """(text, color role) for the right-hand end of the panel's top border."""
+    state = s["state"]
+    if state == "live" and s["last_ts"] and \
+            time.time() - s["last_ts"] > interval * STALE_FACTOR:
+        state = "stalled"
+    txt = state
+    if state == "live":
+        boot = s["info"].get("boot")
+        txt = "live · %s" % ("up " + human_dur(time.time() - boot)
+                             if boot else "%d samples" % s["samples"])
+        if s["local"]:
+            txt = "local · " + txt
+    elif s["detail"]:
+        txt = "%s — %s" % (state, s["detail"][:48])
+    return "● " + txt, (STATE_COLOR.get(state) or s["role"])
+
+
+def meter_width(iw):
+    """Bar width for a gauge row of this inner width: wide where there is
+    room, never so narrow that a percent is unreadable."""
+    return max(8, min(32, iw - 44))
+
+
+def metric_rows(s):
+    """The three gauges as (label, percent, context text). Shared by every
+    layout so a panel and a cramped pane can never disagree on a number."""
+    last, info = s["last"], s["info"]
+    extra = cores_strip(last.get("cores") or [], 32)
+    load = last.get("load")
+    if load:
+        extra += "  load %.2f %.2f %.2f" % tuple(load[:3])
+    temps = dict(last.get("temps") or {})
+    if "cpu" in temps:
+        extra += "  %.0f°C" % temps.pop("cpu")
+    rows = [("CPU", last.get("cpu"), extra)]
+
+    bits = []
+    if info.get("gpu_model"):
+        bits.append(info["gpu_model"])
+    if last.get("gpu_freq"):
+        bits.append("%.0f MHz" % last["gpu_freq"])
+    if last.get("gpu_mem"):
+        bits.append("%s in use" % human_bytes(last["gpu_mem"]))
+    if "gpu" in temps:
+        bits.append("%.0f°C" % temps.pop("gpu"))
+    for k, v in sorted(temps.items()):             # tj, soc0, ... stay labelled
+        bits.append("%s %.0f°C" % (k, v))
+    if not bits and s["state"] == "live":
+        bits = ["no gpu counter on this host"]
+    rows.append(("GPU", last.get("gpu"), " · ".join(bits)))
+
+    mu, mt = last.get("mem_used"), last.get("mem_total")
+    bits = []
+    if mu is not None and mt:
+        bits.append("%s / %s" % (human_bytes(mu), human_bytes(mt)))
+    st, su = last.get("swap_total"), last.get("swap_used")
+    if st:
+        bits.append("swap %s / %s" % (human_bytes(su), human_bytes(st)))
+    elif st == 0:
+        bits.append("no swap")
+    rows.append(("MEM", 100.0 * mu / mt if (mu is not None and mt) else None,
+                 "  ".join(bits)))
+    return rows
+
+
+def put(ui, y, x, segs, xmax):
+    """Draw (text, styles) segments left to right from x, cut at xmax.
+    Returns the column after the last cell drawn."""
+    for text, styles in segs:
+        text = text[:max(0, xmax - x)]
+        if text:
+            ui.aw(y, x, text, *styles)
+            x += len(text)
+    return x
+
+
+# Numbers and the per-core strip get the foreground; the words around them
+# stay in the chrome color, so a context line reads as values, not prose.
+_EMPH = re.compile(r"[▁▂▃▄▅▆▇█]+|(?<![\w.])\d[\d.]*(?:°C| MHz|[KMGT](?![a-z])|%)?")
+
+
+def extra_segments(extra, role, alarm):
+    if alarm:
+        return [(extra, ("red",))]
+    segs, at = [], 0
+    for m in _EMPH.finditer(extra):
+        if m.start() > at:
+            segs.append((extra[at:m.start()], ("gry",)))
+        segs.append((m.group(), (role,) if m.group()[0] in _BLOCKS else ("fg",)))
+        at = m.end()
+    if at < len(extra):
+        segs.append((extra[at:], ("gry",)))
+    return segs
+
+
+def draw_meter(ui, y, x, frac, width, fill_style, track_style):
+    fill, track = meter(frac, width)
+    ui.aw(y, x, fill, fill_style)
+    ui.aw(y, x + len(fill), track, track_style)
+
+
+def gauge_row(ui, y, x, iw, label, pct, mw, extra, role, alarm=False):
+    """One metric line: label, bar in the host's color, number colored by how
+    hot it is, then whatever context the metric carries. Everything is cut at
+    x+iw so a long context string can never run over a panel border. Under
+    alarm the label and context go red too, so no part of the row reads calm
+    while the host is pinned."""
+    chrome = "red" if alarm else "gry"
+    ui.aw(y, x, "%-4s" % label, "red" if alarm else "fg", "bold")
+    if pct is None:
+        draw_meter(ui, y, x + 5, 0.0, mw, chrome, chrome)
+        ui.aw(y, x + 5 + mw + 1, "    —", chrome)
+    else:
+        draw_meter(ui, y, x + 5, pct / 100.0, mw, role, chrome)
+        ui.aw(y, x + 5 + mw + 1, "%5.1f%%" % pct,
+              "red" if alarm else value_color(label, pct), "bold")
+    if extra:
+        put(ui, y, x + 5 + mw + 9, extra_segments(extra, role, alarm), x + iw)
+
+
+def graph_cells(ui, y, x, row, grid, role, chrome):
+    """One graph row; blank cells on a grid line become a faint dot. Drawn as
+    runs of one style so a wide graph costs a few writes, not one per cell."""
+    run, style = [], None
+    for i, ch in enumerate(row):
+        if ch == " " and grid and i % 4 == 2:
+            ch, st = "·", chrome
+        else:
+            st = role
+        if st != style and run:
+            ui.aw(y, x, "".join(run), style)
+            x += len(run)
+            run = []
+        style = st
+        run.append(ch)
+    if run:
+        ui.aw(y, x, "".join(run), style)
+
+
+def grid_rows(gh):
+    """Graph rows that carry a dotted guide: the 50% line, plus the quarters
+    once the graph is tall enough that three guides do not crowd the area."""
+    levels = (25, 50, 75) if gh >= 12 else ((50,) if gh >= 3 else ())
+    return {gh - 1 - int(lv * gh / 100) for lv in levels}
+
+
+def draw_panel(ui, y, W, h, s, interval):
+    """The roomy layout: a box per host, three gauges, and — if the box is
+    tall enough — cpu/gpu/mem area graphs side by side along the bottom,
+    sharing the panel's border instead of nesting boxes inside it."""
+    alarm = host_alarm(s, interval)
+    role = "red" if alarm else s["role"]
+    chrome = "red" if alarm else "gry"
+    iw = W - 4
+    ui.box(y, 0, h, W, "", *((role, "bold") if alarm else (role,)))
+    stat, scol = host_status(s, interval)
+    # the status gives way before the host name does — a panel you cannot
+    # name is useless, and the border has to keep its corners either way
+    stat = stat[:max(0, W - len(s["name"]) - 10)]
+    right = max(2, W - len(stat) - 3)
+    title = host_title(s)
+    rest = title[len(s["name"]):]
+    put(ui, y, 2, [(" " + s["name"], (role, "bold")), (rest + " ", (chrome,))],
+        right - 1)
+    if stat:
+        live = s["state"] == "live" and scol == s["role"]
+        put(ui, y, right, [(" " + stat[:2], ("red" if alarm else scol, "bold")),
+                           (stat[2:] + " ", ("red" if alarm else
+                                             (chrome if live else scol),))], W - 1)
+
+    mw = meter_width(iw)
+    for i, (label, pct, extra) in enumerate(metric_rows(s)):
+        gauge_row(ui, y + 1 + i, 2, iw, label, pct, mw, extra, role, alarm)
+    if s["last"].get("err"):
+        ui.aw(y + 3, W - len(s["last"]["err"][:40]) - 3,
+              s["last"]["err"][:40], "red")
+
+    gh = h - 6                       # rows between the divider and the bottom
+    if gh < 1:
+        return
+    dy = y + 4
+    ui.aw(dy, 0, "├" + "─" * (W - 2) + "┤", role)
+    inner = W - 4                    # three columns and two separators
+    cw = inner // 3
+    grid = grid_rows(gh)
+    x = 1
+    for k, ((name, vals), bw) in enumerate(zip(
+            (("cpu", s["cpu_h"]), ("gpu", s["gpu_h"]), ("mem", s["mem_h"])),
+            (cw, cw, inner - 2 * cw))):
+        if k:
+            ui.aw(dy, x - 1, "┬", role)
+            for r in range(gh):
+                ui.aw(dy + 1 + r, x - 1, "│", role)
+            ui.aw(y + h - 1, x - 1, "┴", role)
+        win = list(vals)[-bw:]
+        cur = [v for v in win if v is not None]
+        head = " %s %.0f%% " % (name, cur[-1]) if cur else " %s " % name
+        ui.aw(dy, x + 1, head[:max(0, bw - 2)], role, "bold")
+        for lbl in (stat_label(win), stat_label(win, short=True)):
+            if len(head) + len(lbl) + 4 <= bw:
+                ui.aw(dy, x + bw - len(lbl) - 1, lbl, chrome)
+                break
+        for r, row in enumerate(graph_rows(win, bw, gh)):
+            graph_cells(ui, dy + 1 + r, x, row, r in grid, role, chrome)
+        x += bw + 1
+
+
+def draw_slim(ui, y, W, h, s, interval):
+    """3-4 rows per host: the gauges with no box. At 4 rows the host gets a
+    header line of its own; at 3 the name moves into a left gutter."""
+    alarm = host_alarm(s, interval)
+    role = "red" if alarm else s["role"]
+    chrome = "red" if alarm else "gry"
+    stat, scol = host_status(s, interval)
+    if alarm:
+        scol = "red"
+    if h >= 4:
+        name = s["name"][:16]
+        stat = stat[:max(0, W - len(name) - 3)]
+        sx = max(len(name) + 2, W - len(stat) - 1)
+        ui.aw(y, 0, name, role, "bold")
+        ui.aw(y, len(name) + 1,
+              host_title(s)[len(s["name"]) + 3:][:max(0, sx - len(name) - 2)],
+              chrome)
+        ui.aw(y, sx, stat, scol, "bold")
+        x, y0 = 1, y + 1
+    else:
+        ui.aw(y, 0, s["name"][:7], role, "bold")
+        ui.aw(y + 1, 0, "●", scol)
+        ui.aw(y + 1, 2, stat[2:6], scol)
+        x, y0 = 8, y
+    iw = W - x - 1
+    mw = meter_width(iw)
+    for i, (label, pct, extra) in enumerate(metric_rows(s)):
+        gauge_row(ui, y0 + i, x, iw, label, pct, mw, extra, role, alarm)
+
+
+def draw_compact(ui, y, W, s, interval):
+    """One row per host, for when even three rows each will not fit."""
+    alarm = host_alarm(s, interval)
+    role = "red" if alarm else s["role"]
+    chrome = "red" if alarm else "gry"
+    stat, scol = host_status(s, interval)
+    ui.aw(y, 0, "%-7s" % s["name"][:7], role, "bold")
+    ui.aw(y, 8, "●", "red" if alarm else scol)
+    # every segment is "CPU <bar> 100%" + a gap; drop the bars outright rather
+    # than draw a three-cell meter nobody can read
+    mw = (W - 10 - 3 * 13) // 3
+    seg = mw + 13 if mw >= 4 else 10
+    x = 10
+    for (label, pct, _) in metric_rows(s):
+        ui.aw(y, x, "%-4s" % label, "red" if alarm else "fg")
+        if mw >= 4:
+            draw_meter(ui, y, x + 4, (pct or 0) / 100.0, mw + 2, role, chrome)
+        ui.aw(y, x + seg - 6, "%5s" % ("—" if pct is None else "%.0f%%" % pct),
+              "red" if alarm else value_color(label, pct), "bold")
+        x += seg
+    if s["state"] != "live" and x < W - 4:
+        ui.aw(y, x, stat[2:][:W - x - 1], scol)
+
+
+class _Shift(object):
+    """A view of the screen moved dx columns right, so a panel drawer that
+    thinks in columns 0..W-1 can fill the right half of a grid unchanged."""
+
+    def __init__(self, ui, dx):
+        self.ui, self.dx = ui, dx
+
+    def aw(self, y, x, s, *styles):
+        self.ui.aw(y, x + self.dx, s, *styles)
+
+    box = UI.box
+
+
+GRID_MIN_W = 46         # narrowest column a boxed panel is drawn at
+GRID_MIN_HOSTS = 4      # from this many hosts on, panels go two to a row
+
+
+KEYS = (("q", "quit"), ("c", "theme"), ("b", "bg"), ("r", "reconnect"),
+        ("p", "pause"))
+
+
+def draw(ui, hosts, args, paused):
+    scr = ui.scr
+    scr.erase()
+    H, W = scr.getmaxyx()
+    if H < 6 or W < 46:
+        ui.aw(0, 0, "terminal too small (need >= 46x6)", "yel")
+        scr.noutrefresh()
+        return
+    # ---- grid: two panels a row once there are enough hosts, as long as
+    # each column stays wide enough and the rows still get boxed panels ----
+    n = len(hosts)
+    avail = H - 2
+    cols = 1
+    if n >= GRID_MIN_HOSTS and W >= 2 * GRID_MIN_W and avail // -(-n // 2) >= 5:
+        cols = 2
+    colw = [W] if cols == 1 else [W // 2, W - W // 2]
+    snaps = [h.snapshot(colw[i % cols]) for i, h in enumerate(hosts)]
+    live = sum(1 for s in snaps if s["state"] == "live")
+
+    # ---- header: a badge, one dot per host in its own (or its state's)
+    # color, the cadence, and the clock ----
+    clock = time.strftime("%H:%M:%S")
+    cx = W - len(clock) - 1
+    right = "%d/%d live · every %.1fs" % (live, len(snaps), args.interval)
+    if paused:
+        right = "PAUSED · " + right
+    rx = cx - len(right) - 2
+    segs = [(" host-top ", ("gry", "rev", "bold")), (" ", ())]
+    for s in snaps:
+        alarm = host_alarm(s, args.interval)
+        _, scol = host_status(s, args.interval)
+        segs += [(" ● ", ("red" if alarm else scol, "bold")),
+                 (s["name"] + " ", (s["role"],))]
+    end = put(ui, 0, 0, segs, max(10, rx - 1))
+    if rx > end:
+        if paused:
+            ui.aw(0, rx, "PAUSED", "yel", "bold")
+            ui.aw(0, rx + 6, right[6:], "gry")
+        else:
+            ui.aw(0, rx, right, "gry")
+    ui.aw(0, cx, clock, "fg", "bold")
+
+    # ---- host panels; the layout drops a tier at a time as rows run out ----
+    # every host gets the same height — a taller first panel just to use up
+    # the remainder reads as a glitch, so any spare rows stay at the bottom
+    if cols == 2:
+        ph = avail // -(-n // 2)
+        for i, s in enumerate(snaps):
+            r, c = divmod(i, 2)
+            draw_panel(_Shift(ui, c * colw[0]), 1 + r * ph, colw[c],
+                       ph if ph >= 8 else 5, s, args.interval)
+        snaps = []
+    ph = avail // n if n else 0
+    y = 1
+    for s in snaps:
+        if ph >= 5:
+            draw_panel(ui, y, W, ph if ph >= 8 else 5, s, args.interval)
+        elif ph >= 3:
+            draw_slim(ui, y, W, ph, s, args.interval)
+        else:
+            if y >= H - 1:
+                break
+            draw_compact(ui, y, W, s, args.interval)
+        y += max(1, ph)
+
+    # ---- footer: keys lit, their meaning in the chrome color ----
+    right = "theme %s · bg %s" % (ui.theme_name, ui.bg_name) if ui.color else ""
+    rx = W - len(right) - 1 if right else W
+    if rx < 12:                      # no room for both: the keys win
+        right, rx = "", W
+    if right:
+        ui.aw(H - 1, rx, right, "gry")
+    segs = []
+    for k, what in KEYS:
+        segs += [(" " + k, ("fg", "bold")), (" " + what + " ", ("gry",))]
+    put(ui, H - 1, 0, segs, rx - 1)
+    scr.noutrefresh()
+
+
+# ----------------------------------------------------------------------------
+# Driver
+# ----------------------------------------------------------------------------
+
+def start_hosts(names, args):
+    src = agent_source()
+    hosts = []
+    for i, name in enumerate(names):
+        h = Host(name, HOST_ROLES[i % len(HOST_ROLES)])
+        t = threading.Thread(target=pump, args=(h, args, src), daemon=True)
+        t.start()
+        hosts.append(h)
+    return hosts
+
+
+def run_ui(scr, hosts, args):
+    import curses
+    curses.curs_set(0)
+    scr.nodelay(True)
+    ui = UI(scr, not args.no_color)
+    paused = False
+    while True:
+        draw(ui, hosts, args, paused)
+        curses.doupdate()
+        t_end = time.time() + REDRAW
+        while True:
+            ch = scr.getch()
+            if ch == -1:
+                if time.time() >= t_end:
+                    break
+                time.sleep(0.02)
+                continue
+            if ch in (ord("q"), 27):
+                return
+            if ch == ord("c"):
+                ui.cycle_theme(1)
+            elif ch == ord("C"):
+                ui.cycle_theme(-1)
+            elif ch == ord("b"):
+                ui.cycle_bg(1)
+            elif ch == ord("B"):
+                ui.cycle_bg(-1)
+            elif ch == ord("p"):
+                paused = not paused
+            elif ch == ord("r"):
+                for h in hosts:
+                    h.kick.set()
+                    h.kill_proc()
+            elif ch == curses.KEY_RESIZE:
+                break
+            break
+        if paused:
+            # stop redrawing, but the reader threads keep filling history
+            while True:
+                ch = scr.getch()
+                if ch == ord("p"):
+                    paused = False
+                    break
+                if ch in (ord("q"), 27):
+                    return
+                time.sleep(0.05)
+
+
+def once(names, args):
+    """One hello + one sample per host as raw JSON — the debugging path when
+    a host is quiet and you want to see what its agent actually says."""
+    src = agent_source()
+    rc = 0
+    for name in names:
+        cmd, local = build_cmd(name, args)
+        sys.stdout.write("== %s (%s) ==\n" % (name, "local" if local else "ssh"))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True)
+        p.stdin.write(src + "\n")
+        p.stdin.close()
+        got = 0
+        deadline = time.time() + 15
+        while got < 2 and time.time() < deadline:
+            line = p.stdout.readline()
+            if not line:
+                break
+            sys.stdout.write(line)
+            got += 1
+        if got < 2:
+            rc = 1
+            sys.stdout.write("  no sample; stderr: %s\n"
+                             % p.stderr.read().strip()[:400])
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return rc
+
+
+def self_test():
+    ok = True
+
+    # the agent block must stand alone: compiling the extracted text is what
+    # catches a reference that only resolves in the full file
+    src = agent_source()
+    assert BEGIN_MARK not in src and END_MARK not in src
+    for needed in ("class DarwinProbe", "class LinuxProbe", "def agent_main"):
+        assert needed in src, needed
+    compile(src, "<agent>", "exec")
+    ns = {"__name__": "agent_isolated"}
+    body = src.rsplit("agent_main(", 1)[0]
+    exec(compile(body, "<agent-body>", "exec"), ns)
+    print("agent block extracts and runs standalone (%d bytes)" % len(src))
+
+    # ---- macOS parsers ----
+    vm = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+          "Pages free:                       100.\n"
+          "Pages active:                     200.\n"
+          "Pages inactive:                    50.\n"
+          "Pages speculative:                 10.\n"
+          "Pages wired down:                 300.\n"
+          "Pages occupied by compressor:      40.\n")
+    pages, psz = ns["parse_vm_stat"](vm)
+    assert psz == 16384 and pages["pages wired down"] == 300, (pages, psz)
+    used, total = ns["mac_mem"](vm)
+    assert used == (200 + 300 + 40) * 16384, used
+    assert total == (200 + 300 + 40 + 100 + 50 + 10) * 16384, total
+    assert ns["mac_mem"]("") == (None, None)
+    su, st = ns["parse_swapusage"]("total = 4096.00M  used = 1234.50M  "
+                                   "free = 2861.50M  (encrypted)")
+    assert st == 4096 * 1024 ** 2 and abs(su - 1234.5 * 1024 ** 2) < 1, (su, st)
+    assert ns["parse_swapusage"]("") == (None, None)
+    io = ('"Device Utilization %"=3\n"num_cores"=20\n'
+          '"In use system memory"=1234\n"Device Utilization %"=88\n')
+    assert ns["parse_ioreg"](io) == (88, 1234, 20), ns["parse_ioreg"](io)
+    assert ns["parse_ioreg"]("") == (None, None, None)
+    binned = '  "gpu-core-count" = 32\n  "GPUConfigurationVariable"={"num_cores"=40}\n'
+    assert ns["parse_ioreg"](binned)[2] == 32, ns["parse_ioreg"](binned)
+    print("macOS parsers: vm_stat, swapusage, ioreg — ok")
+
+    # ---- temperature grouping: placeholders and gated sensors stay out ----
+    avg = ns["_mean_temps"]({"cpu": [40.0, 40.0, 61.0, 58.0], "gpu": [-4.5, 0.8],
+                             "tj": [], "soc": [151.0, 70.5]})
+    assert avg == {"cpu": 59.5, "soc": 70.5}, avg
+    if sys.platform == "darwin":
+        src_ = ns["find_mac_temps"]()
+        live = src_.read() if src_ else {}
+        print("macOS temps: %s via %s (%d keys)" % (
+            " ".join("%s %.0f°C" % kv for kv in sorted(live.items())) or "none",
+            type(src_).__name__ if src_ else "nothing", len(src_.keys) if src_ else 0))
+    else:
+        print("temperature grouping — ok")
+
+    # ---- Linux parsers ----
+    st_txt = ("cpu  10 0 10 80 0 0 0 0 0 0\n"
+              "cpu0 5 0 5 40 0 0 0 0 0 0\n"
+              "cpu1 5 0 5 40 0 0 0 0 0 0\n"
+              "intr 1 2 3\n")
+    cores = ns["parse_proc_stat"](st_txt)
+    assert len(cores) == 2, cores          # the aggregate line is dropped
+    mi = ns["parse_meminfo"]("MemTotal:  7802776 kB\nMemAvailable: 5907848 kB\n")
+    assert mi["MemTotal"] == 7802776 * 1024, mi
+    print("Linux parsers: /proc/stat, /proc/meminfo — ok")
+
+    # ---- tick math ----
+    # Linux column 3 is idle: 50 busy ticks of 100 elapsed on each core.
+    prev = [[0, 0, 0, 0], [0, 0, 0, 0]]
+    cur = [[30, 20, 0, 50], [10, 10, 0, 80]]
+    tot, per = ns["cpu_from_ticks"](prev, cur, 3)
+    assert per == [50.0, 20.0] and tot == 35.0, (tot, per)
+    # Darwin column 2 is idle, and its counters are 32-bit: a wrap must read
+    # as a small delta, not as a 4-billion-tick spike.
+    tot, per = ns["cpu_from_ticks"]([[0, 0, 0xFFFFFFF0, 0]],
+                                    [[0, 0, 0x00000008, 0]], 2)
+    assert tot == 0.0 and per == [0.0], (tot, per)
+    assert ns["cpu_from_ticks"](None, cur, 3) == (None, [])
+    assert ns["cpu_from_ticks"]([[0, 0, 0, 0]], cur, 3) == (None, [])
+    assert ns["cpu_from_ticks"]([[0, 0, 0, 0]], [[0, 0, 0, 0]], 3) == (0.0, [0.0])
+    print("cpu tick deltas: per-core, idle column, 32-bit wrap — ok")
+
+    # ---- drawing helpers ----
+    assert meter(0.5, 10) == ("█████", "·····"), meter(0.5, 10)
+    assert meter(2.0, 4) == ("████", "") and meter(-1, 4) == ("", "····")
+    assert meter(0.55, 10) == ("█████▌", "····"), meter(0.55, 10)   # eighths
+    assert cores_strip([0, 100, 50], 8) == "▁█▄", cores_strip([0, 100, 50], 8)
+    assert cores_strip([0] * 20, 4) == "▁▁▁▁"       # strip stays within width
+    assert cores_strip([], 8) == ""
+    rows = graph_rows([0, 50, 100], 3, 2)
+    assert len(rows) == 2 and all(len(r) == 3 for r in rows), rows
+    # 50% of a 2-row box is exactly the whole bottom cell, nothing above it
+    assert rows == ["  █", " ██"], rows
+    # a fixed 0-100 scale is the point: the same value draws the same height
+    # no matter what else is in the window, so hosts stay comparable
+    assert graph_rows([100], 1, 2) == graph_rows([100, 100], 1, 2)
+    assert graph_rows([50, 100], 2, 2)[0] == " █"
+    assert graph_rows([], 4, 2) == ["    ", "    "]
+    assert graph_rows([None, 100], 2, 1)[0] == " █"   # gaps draw empty
+    assert "peak 100% · avg 50% · low 0%" in stat_label([0, 50, 100])
+    assert stat_label([None, None]) == " no data "
+    assert stat_label([0, 100], short=True) == " peak 100% · avg 50% "
+    assert grid_rows(2) == set() and grid_rows(4) == {1}, grid_rows(4)
+    assert grid_rows(8) == {3} and grid_rows(12) == {2, 5, 8}, grid_rows(12)
+    segs = extra_segments("▁█  load 4.10  Apple M3 · 306 MHz", "cyn", False)
+    assert ("▁█", ("cyn",)) in segs and ("4.10", ("fg",)) in segs, segs
+    assert ("306 MHz", ("fg",)) in segs and ("M3", ("fg",)) not in segs, segs
+    assert extra_segments("x 1", "cyn", True) == [("x 1", ("red",))]
+    assert human_bytes(0) == "0" and human_bytes(None) == "—"
+    assert human_bytes(38654705664) == "36.0G", human_bytes(38654705664)
+    assert human_dur(0) == "0m" and human_dur(90061) == "1d 1h"
+    assert zone_color(None) == "gry" and zone_color(0) == "grn"
+    assert zone_color(70) == "yel" and zone_color(90) == "red"
+    # only the gpu warns: a box full of model weights is not a problem
+    assert value_color("GPU", 70) == "yel" and value_color("GPU", 90) == "red"
+    for hot in (70, 89, 95, 100):
+        assert value_color("MEM", hot) == "grn", hot
+        assert value_color("CPU", hot) == "grn", hot
+    assert value_color("MEM", None) == "gry"
+    print("gauges, core strips, fixed-scale graphs, humanizers — ok")
+
+    # ---- the 90% alarm ----
+    def alarm_snap(cpus, gpus, state="live", age=0.0):
+        h = Host("x", "cyn")
+        for c, g in zip(cpus, gpus):
+            h.on_sample({"cpu": c, "gpu": g, "mem_used": 1, "mem_total": 2})
+        with h.lock:
+            h.state = state
+            h.last_ts -= age
+        return h.snapshot(200)
+
+    assert host_alarm(alarm_snap([10], [10]), 1.0) is False
+    assert host_alarm(alarm_snap([95], [0]), 1.0) is True      # cpu alone
+    assert host_alarm(alarm_snap([0], [95]), 1.0) is True      # gpu alone
+    assert host_alarm(alarm_snap([90.0], [0]), 1.0) is True    # the band edge
+    assert host_alarm(alarm_snap([89.9], [0]), 1.0) is False
+    # memory is deliberately NOT an alarm: a Mac sits near full all day
+    assert host_alarm(alarm_snap([5], [5]), 1.0) is False
+    # latched for ALARM_HOLD samples after the breach, then released
+    assert host_alarm(alarm_snap([95, 10, 10], [0] * 3), 1.0) is True
+    assert host_alarm(alarm_snap([95, 10, 10, 10], [0] * 4), 1.0) is False
+    # a host that drops off at 95% must not stay red on a frozen reading
+    assert host_alarm(alarm_snap([95], [0], state="retry"), 1.0) is False
+    assert host_alarm(alarm_snap([95], [0], age=10.0), 1.0) is False
+    print("alarm: cpu or gpu >= %g%%, latched %d samples, needs a live host"
+          % (ALARM_PCT, ALARM_HOLD))
+
+    # ---- themes: the per-host colors must never collide ----
+    for themes, bgs, lim in ((THEMES, BACKGROUNDS, 256),
+                             (THEMES_BASIC, BACKGROUNDS_BASIC, 8)):
+        for th in themes:
+            for bg_name, bg in bgs:
+                c = compose(th, bg, lim)
+                roles = [c[r] for r in DISTINCT_ROLES]
+                assert len(set(roles)) == len(roles), (th["name"], bg_name)
+                assert bg not in roles, (th["name"], bg_name)
+                assert all(0 <= c[r] < lim for r in DISTINCT_ROLES + ["gry"]), th
+                assert "red" not in HOST_ROLES        # reserved for the alarm
+    print("themes: %d host colors + the alarm red stay distinct on every "
+          "background" % len(HOST_ROLES))
+
+    # ---- command construction ----
+    args = argparse.Namespace(python="python3", all_ssh=False, interval=1.0)
+    cmd, local = build_cmd("definitely-not-this-machine", args)
+    assert cmd[0] == "ssh" and cmd[-1] == "python3 -u -" and not local, cmd
+    assert "BatchMode=yes" in cmd, cmd
+    me = os.uname().nodename.split(".")[0]
+    cmd, local = build_cmd(me, args)
+    assert local and cmd[1:] == ["-u", "-"], (cmd, local)
+    cmd, local = build_cmd(me, argparse.Namespace(python="python3",
+                                                  all_ssh=True, interval=1.0))
+    assert cmd[0] == "ssh" and not local, cmd     # --all-ssh overrides
+    print("link commands: ssh vs local shortcut, --all-ssh — ok")
+
+    # ---- end to end on this machine ----
+    probe = ns["DarwinProbe"]() if sys.platform == "darwin" else ns["LinuxProbe"]()
+    info = probe.static()
+    assert info.get("ncpu"), info
+    assert info.get("memtotal"), info
+    probe.prime()
+    time.sleep(0.4)
+    s = probe.sample()
+    assert s.get("cpu") is not None and 0 <= s["cpu"] <= 100, s
+    assert len(s.get("cores") or []) == info["ncpu"], (len(s.get("cores") or []),
+                                                       info["ncpu"])
+    assert s.get("mem_used") and s.get("mem_total"), s
+    assert 0 < s["mem_used"] <= s["mem_total"], s
+    gpu = s.get("gpu")
+    assert gpu is None or 0 <= gpu <= 100, gpu
+    print("live sample on this host: cpu %.1f%% · gpu %s · mem %s/%s — ok" % (
+        s["cpu"], "—" if gpu is None else "%.0f%%" % gpu,
+        human_bytes(s["mem_used"]), human_bytes(s["mem_total"])))
+
+    # ---- the whole UI draws into an offscreen pad at many sizes ----
+    ok = ok and _draw_test()
+    print("self-test: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+class _FakeUI(object):
+    """Enough of UI to run draw() with no terminal: it records what would be
+    written and screams if anything lands outside the screen."""
+    def __init__(self, h, w):
+        self.h, self.w = h, w
+        self.color = True
+        self.theme_name = "classic"
+        self.bg_name = "default"
+        self.cells = {}
+        self.styles = {}
+        self.scr = self
+
+    def getmaxyx(self):
+        return self.h, self.w
+
+    def erase(self):
+        self.cells = {}
+        self.styles = {}
+
+    def noutrefresh(self):
+        pass
+
+    def aw(self, y, x, s, *styles):
+        if y < 0 or y >= self.h or x >= self.w:
+            return
+        if x < 0:
+            s, x = s[-x:], 0
+        for i, ch in enumerate(s[:self.w - x]):
+            self.cells[(y, x + i)] = ch
+            self.styles[(y, x + i)] = set(styles)
+
+    def colors(self, y0, y1):
+        """Every style name used on rows y0..y1 — what the alarm test reads."""
+        out = set()
+        for (y, _), st in self.styles.items():
+            if y0 <= y <= y1:
+                out |= st
+        return out
+
+    def render(self):
+        out = []
+        for y in range(self.h):
+            out.append("".join(self.cells.get((y, x), " ")
+                               for x in range(self.w)).rstrip())
+        return "\n".join(out)
+
+
+_FakeUI.box = UI.box
+_FakeUI.attr = lambda self, *s: 0
+
+
+def _draw_test():
+    args = argparse.Namespace(interval=1.0, no_color=False, python="python3",
+                              all_ssh=False)
+    # a fixed 3-host fixture: the geometry checks below assume three panels
+    hosts = [Host(n, HOST_ROLES[i]) for i, n in enumerate(["eva", "nova", "ghost"])]
+    hosts[0].on_hello({"os": "macOS 27.0", "arch": "arm64", "ncpu": 14,
+                       "cpu_model": "Apple M3 Max", "gpu_cores": 30,
+                       "memtotal": 38654705664, "boot": time.time() - 90061,
+                       "gpu_model": "Apple M3 Max GPU"})
+    for i in range(50):
+        hosts[0].on_sample({"cpu": 20 + i, "cores": [30.0] * 14, "gpu": 88.0,
+                            "mem_used": 27 * 1024 ** 3, "mem_total": 36 * 1024 ** 3,
+                            "swap_used": 1024 ** 3, "swap_total": 4 * 1024 ** 3,
+                            "load": [4.1, 3.8, 3.2], "gpu_mem": 22 * 1024 ** 3,
+                            "temps": {"cpu": 61.2, "gpu": 83.1}})
+    hosts[1].set("retry", "ssh: connect to host nova port 22: Host is down")
+    hosts[2].on_hello({"os": "Ubuntu 22.04", "arch": "aarch64", "ncpu": 6,
+                       "cpu_model": "ARMv8 Processor rev 1", "memtotal": 7990042624,
+                       "gpu_model": "integrated GPU", "boot": time.time() - 7171897})
+    hosts[2].on_sample({"cpu": 4.0, "cores": [4.0] * 6, "gpu": 0.0,
+                        "mem_used": 2 * 1024 ** 3, "mem_total": 7 * 1024 ** 3,
+                        "swap_total": 0, "swap_used": 0,
+                        "temps": {"cpu": 56.5, "gpu": 58.5}, "gpu_freq": 306.0})
+    good = True
+    for (h, w) in ((50, 160), (45, 120), (34, 100), (24, 80), (12, 60),
+                   (8, 50), (5, 40), (60, 46)):
+        ui = _FakeUI(h, w)
+        try:
+            draw(ui, hosts, args, paused=False)
+        except Exception as e:
+            print("draw failed at %dx%d: %s: %s" % (h, w, type(e).__name__, e))
+            good = False
+            continue
+        txt = ui.render()
+        if h >= 6 and w >= 46:
+            assert "eva" in txt and "ghost" in txt, (h, w)
+            for row, line in enumerate(txt.split("\n")):
+                assert len(line) <= w, (h, w, row, line)
+                # a row that opens a panel border must close it: this is what
+                # catches a long context string running over the right edge
+                if line[:1] in ("│", "╭", "╰", "├"):
+                    closed = ui.cells.get((row, w - 1), " ")
+                    assert closed in "│╮╯┤", (h, w, row, repr(closed), line)
+    if good:
+        print("draw: 8 terminal sizes from 160x50 down to 40x5 — ok")
+    # the panel at a roomy size must actually carry the numbers
+    ui = _FakeUI(50, 160)
+    draw(ui, hosts, args, paused=False)
+    txt = ui.render()
+    for needed in ("CPU", "GPU", "MEM", "Apple M3 Max", "up 1d 1h",
+                   "load 4.10", "peak", "swap", "56°C", "61°C", "83°C",
+                   "Host is down"):
+        if needed not in txt:
+            print("draw: missing %r from the rendered panel" % needed)
+            good = False
+
+    # ---- four hosts go two to a row, every box closed on both sides ----
+    quad = hosts + [Host("disorder", HOST_ROLES[3])]
+    for (h, w) in ((40, 160), (24, 100), (24, 80)):
+        qi = _FakeUI(h, w)
+        draw(qi, quad, args, paused=False)
+        lines = qi.render().split("\n")
+        gridded = lines[1].count("╭") == 2
+        if gridded != (w >= 2 * GRID_MIN_W):
+            print("grid: %dx%d drew %s" % (h, w, "2x2" if gridded else "stacked"))
+            good = False
+        if gridded and not ("eva" in lines[1] and "nova" in lines[1]):
+            print("grid: top row should be eva and nova at %dx%d" % (h, w))
+            good = False
+        for row, line in enumerate(lines):
+            if len(line) > w:
+                print("grid: row %d overruns %d columns at %dx%d" % (row, w, h, w))
+                good = False
+    if good:
+        print("grid: four hosts lay out 2x2 when wide, stacked when not — ok")
+
+    # ---- the alarm has to reach the actual pixels, not just the rule ----
+    ph = (50 - 2) // 3
+    eva, ghost = (1, ph), (1 + 2 * ph, 3 * ph)
+    # eva is at 69% cpu / 88% gpu here: hot, but not hot enough to repaint
+    assert "red" not in ui.colors(*eva), ui.colors(*eva)
+    assert hosts[0].role in ui.colors(*eva)
+
+    hosts[0].on_sample({"cpu": 96.0, "cores": [96.0] * 14, "gpu": 40.0,
+                        "mem_used": 27 * 1024 ** 3, "mem_total": 36 * 1024 ** 3,
+                        "load": [9.1, 8.8, 8.2], "gpu_mem": 22 * 1024 ** 3})
+    ui = _FakeUI(50, 160)
+    draw(ui, hosts, args, paused=False)
+    hot = ui.colors(*eva)
+    # nothing in that panel may still read calm: not the host color, not the
+    # gray chrome, and not the green a 40% gpu or a 75% memory bar would take
+    for stale in (hosts[0].role, "gry", "grn", "yel"):
+        if stale in hot:
+            print("draw: pinned panel still shows %r" % stale)
+            good = False
+    if "red" not in hot:
+        print("draw: pinned panel never turned red")
+        good = False
+    # and the alarm stays inside its own panel
+    calm = ui.colors(*ghost)
+    if "red" in calm or hosts[2].role not in calm:
+        print("draw: the alarm leaked into a calm host's panel")
+        good = False
+    if good:
+        print("alarm: a pinned host repaints its whole panel, neighbours "
+              "keep their colors — ok")
+
+    # ---- cpu and memory never reach for the warning color ----
+    # 80% cpu and 97% memory is a Tuesday on a box that serves models; the
+    # only thing that may repaint the panel is the >=90% cpu/gpu alarm
+    hosts[1].on_hello({"os": "macOS 27.0", "arch": "arm64", "ncpu": 10,
+                       "cpu_model": "Apple M4", "memtotal": 17179869184})
+    hosts[1].on_sample({"cpu": 80.0, "cores": [80.0] * 10, "gpu": 10.0,
+                        "mem_used": int(15.5 * 1024 ** 3),
+                        "mem_total": 16 * 1024 ** 3, "load": [8.0, 7.5, 7.1]})
+    ui = _FakeUI(50, 160)
+    draw(ui, hosts, args, paused=False)
+    busy = ui.colors(1 + ph, 2 * ph)
+    for wrong in ("yel", "red"):
+        if wrong in busy:
+            print("draw: cpu 80%% / mem 97%% still paints %r" % wrong)
+            good = False
+    if hosts[1].role not in busy:
+        print("draw: the busy host lost its own color")
+        good = False
+    if good:
+        print("warnings: only the gpu grades — cpu 80% / mem 97% stay "
+              "plain — ok")
+    return good
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="live cpu/gpu/memory dashboard for a fleet of hosts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="keys: q quit · c/C theme · b/B background · r reconnect · "
+               "p pause")
+    ap.add_argument("hosts", nargs="*", default=None,
+                    help="ssh host names (default: %s)" % " ".join(DEFAULT_HOSTS))
+    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
+                    help="seconds between samples (default 1.0)")
+    ap.add_argument("--python", default="python3",
+                    help="python to run the agent with on the remote side")
+    ap.add_argument("--all-ssh", action="store_true",
+                    help="use ssh even for the machine we are running on")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--once", action="store_true",
+                    help="print one JSON sample per host and exit")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+    names = args.hosts or DEFAULT_HOSTS
+    args.interval = max(0.2, args.interval)
+
+    if args.self_test:
+        return self_test()
+    if args.once:
+        return once(names, args)
+
+    import curses
+    hosts = start_hosts(names, args)
+    try:
+        curses.wrapper(run_ui, hosts, args)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for h in hosts:
+            h.stop.set()
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            for h in hosts:
+                h.kill_proc()
+            if not any(h.proc is not None and h.proc.poll() is None
+                       for h in hosts):
+                break
+            time.sleep(0.05)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,101 @@
+# ---- Word-by-word editing ----
+# Option acts as Alt, so Option+Backspace / Option+Left/Right reach the shell as word motions.
+macos-option-as-alt = left
+# Cmd+Backspace = delete word back; Cmd+Left/Right = move word by word
+keybind = cmd+backspace=text:\x1b\x7f
+keybind = cmd+left=text:\x1bb
+keybind = cmd+right=text:\x1bf
+
+# ---- Focus terminal from anywhere (needs Accessibility permission) ----
+# F12 is handled by Hammerspoon (~/.hammerspoon/init.lua): it brings a maximized
+# terminal to the front from anywhere, opening a fresh one if none is open.
+# Shift+F12 from anywhere: a fresh tab in the existing window.
+keybind = global:shift+f12=new_tab
+
+# ---- Tabs ----
+keybind = cmd+t=new_tab
+keybind = shift+left=previous_tab
+keybind = shift+right=next_tab
+keybind = cmd+shift+left=move_tab:-1
+keybind = cmd+shift+right=move_tab:1
+
+# ---- Look ----
+font-family = "JetBrains Mono"
+font-size = 17
+# A little more air between lines
+adjust-cell-height = 8%
+# Tokyo Night colours, on a pure black background
+theme = "TokyoNight Night"
+background = 000000
+# Cursor in the EvolMonkey red
+cursor-color = #ff0000
+split-divider-color = #292e42
+# Slightly see-through, with the desktop blurred behind (delete both lines for solid black)
+background-opacity = 0.95
+background-blur = 20
+maximize = true
+
+# ---- Run in background: closing the last window keeps Ghostty alive for F12 ----
+quit-after-last-window-closed = false
+
+# ---- Quality of life ----
+# Selecting text copies it to the clipboard
+copy-on-select = clipboard
+# Middle click pastes (macOS has no selection buffer, so paste the clipboard)
+middle-click-action = clipboard-paste
+mouse-hide-while-typing = true
+window-padding-x = 10
+window-padding-y = 8
+window-padding-balance = true
+# Full-screen programs paint the padding too, instead of leaving a black frame
+window-padding-color = extend
+cursor-style = underline
+cursor-style-blink = true
+shell-integration = zsh
+shell-integration-features = no-cursor,sudo,title,ssh-env,ssh-terminfo
+# New tabs/splits open in the current folder
+window-inherit-working-directory = true
+# Restore windows and tabs after a restart
+window-save-state = always
+macos-titlebar-style = tabs
+# Warn before pasting multi-line or unsafe text
+clipboard-paste-protection = true
+unfocused-split-opacity = 0.8
+# Shift+Enter inserts a newline (multi-line input in Claude Code and similar)
+keybind = shift+enter=text:\n
+# 100 MB of scrollback per terminal (default is 10 MB)
+scrollback-limit = 100000000
+window-colorspace = display-p3
+font-thicken = true
+
+# ---- Scrolling ----
+# Shift+PageUp / Shift+PageDown: scroll Ghostty's own scrollback one page.
+keybind = shift+page_up=scroll_page_up
+keybind = shift+page_down=scroll_page_down
+# Plain PageUp / PageDown are not bound here: they go to the program, so tmux
+# pages its history and less/vim/mc page as usual.
+
+# ---- Splits ----
+keybind = cmd+d=new_split:right
+keybind = cmd+shift+d=new_split:down
+keybind = cmd+alt+left=goto_split:left
+keybind = cmd+alt+right=goto_split:right
+keybind = cmd+alt+up=goto_split:up
+keybind = cmd+alt+down=goto_split:down
+keybind = cmd+shift+enter=toggle_split_zoom
+keybind = cmd+k=clear_screen
+
+# Hide from Dock and Cmd+Tab; F12 shows it
+#macos-hidden = always
+
+# ---- Notifications ----
+# When a command that ran for 30 s or more finishes in a tab or split you are
+# not looking at: macOS notification, plus the bell (a bell mark on the tab title
+# and a Dock bounce). Works for commands typed in a local shell.
+notify-on-command-finish = unfocused
+notify-on-command-finish-action = bell,notify
+notify-on-command-finish-after = 30s
+
+# ---- Background ----
+# Cmd+Shift+O: switch between the slightly see-through background and solid black
+keybind = cmd+shift+o=toggle_background_opacity

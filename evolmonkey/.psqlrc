@@ -1,0 +1,36 @@
+-- ~/.psqlrc
+\set QUIET 1
+
+--SELECT http_set_curlopt('CURLOPT_TIMEOUT', '30');
+
+-- Display
+\x auto
+\timing on
+\pset null '∅'
+\pset linestyle unicode
+\pset border 2
+
+-- Pager: pspg (scrollable tables, frozen header and first column); quits by itself
+-- when the result fits on one screen. Style 16 uses the terminal's own colours.
+\setenv PSQL_PAGER 'pspg -X -F -s 16'
+
+-- Behaviour
+\set ON_ERROR_ROLLBACK interactive
+\set COMP_KEYWORD_CASE upper
+\set HISTCONTROL ignoredups
+\set HISTSIZE 20000
+-- One history file per database
+\set HISTFILE ~/.psql_history- :DBNAME
+
+-- Prompt: user@host:port in grey, database in blue, transaction state in red
+-- (* = in a transaction, ! = failed transaction, ? = disconnected)
+\set PROMPT1 '%[%033[38;2;115;122;162m%]%n@%m:%>%[%033[0m%] %[%033[1;38;2;122;162;247m%]%/%[%033[0m%]%[%033[38;2;247;118;142m%]%x%[%033[0m%]%R%# '
+\set PROMPT2 '%w%[%033[38;2;115;122;162m%]%R%#%[%033[0m%] '
+
+set search_path to dba,public;
+--SET openai.api_uri = 'http://127.0.0.1:11434/v1/';
+--SET openai.api_key = 'none';
+--SET openai.prompt_model = 'llama3.1:latest';
+--SET openai.embedding_model = 'mxbai-embed-large';
+
+\unset QUIET
