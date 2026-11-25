@@ -45,6 +45,7 @@ Usage:
 
 Keys:  q / Esc quit   ·   c cycle color theme (C reverse)   ·   b cycle
        background (B reverse)   ·   r reconnect all   ·   p pause
+       ·   Ctrl-L repaint the whole screen now
 """
 
 # ----------------------------------------------------------------------------
@@ -743,6 +744,7 @@ from collections import deque
 DEFAULT_HOSTS = ["eva", "nova", "ghost", "disorder"]
 DEFAULT_INTERVAL = 1.0
 REDRAW = 0.25                      # UI cadence; samples arrive on --interval
+FULL_REPAINT = 10.0                # seconds between full-screen repaints (see run_ui)
 HIST = 2048                        # samples kept per metric per host
 STALE_FACTOR = 4.0                 # missed intervals before a host reads stale
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -1598,13 +1600,50 @@ def start_hosts(names, args):
     return hosts
 
 
+def quiet_tty():
+    """Switch off the tty's "extended" input keys while the UI is up.
+
+    curses' cbreak mode leaves IEXTEN on, and on macOS that keeps Ctrl-O bound
+    to the kernel's DISCARD function: one stray Ctrl-O in this pane and the
+    kernel silently throws away everything written to the terminal until the
+    next keypress. curses never learns its output was dropped, so the screen
+    stays out of step with what it believes is there — stale graph cells,
+    leftovers of older frames — and nothing ever repaints them. Ctrl-V
+    (literal-next) and Ctrl-T (kernel status line) go the same way. curses
+    restores the original tty modes on exit."""
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.IEXTEN
+        off = os.fpathconf(fd, "PC_VDISABLE")
+        for name in ("VDISCARD", "VLNEXT", "VSTATUS", "VDSUSP"):
+            idx = getattr(termios, name, None)
+            if idx is not None:
+                attrs[6][idx] = bytes([off])
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass                         # not a tty, or an OS without these: fine
+
+
 def run_ui(scr, hosts, args):
     import curses
     curses.curs_set(0)
     scr.nodelay(True)
+    quiet_tty()
     ui = UI(scr, not args.no_color)
     paused = False
+    next_full = 0.0
     while True:
+        # curses only sends the cells it believes have changed. If the
+        # terminal ever disagrees with that belief (output lost or discarded,
+        # a resize the two sides handled differently, another program writing
+        # to the pane) the damage would otherwise stay on screen for good.
+        # Periodically forget what is on screen so the next update rewrites
+        # every cell; Ctrl-L and a resize force it at once.
+        if time.time() >= next_full:
+            scr.redrawwin()
+            next_full = time.time() + FULL_REPAINT
         draw(ui, hosts, args, paused)
         curses.doupdate()
         t_end = time.time() + REDRAW
@@ -1631,7 +1670,8 @@ def run_ui(scr, hosts, args):
                 for h in hosts:
                     h.kick.set()
                     h.kill_proc()
-            elif ch == curses.KEY_RESIZE:
+            elif ch in (curses.KEY_RESIZE, 12):      # 12 = Ctrl-L
+                next_full = 0.0
                 break
             break
         if paused:

@@ -203,7 +203,7 @@ alias lt='ls -ltr'     # long, newest at the bottom
 alias tree='LS_COLORS= eza --icons=auto --hyperlink=auto --group-directories-first --tree'
 alias ai='cd ~/Data/work/AI/'
 
-alias push_agent='/Users/vasilis/Data/work/bin/sync_agent.sh && cd /Users/vasilis/AGENT && git add -A && git commit ; git push ; cd '
+alias push_agent='/Users/vasilis/Data/work/bin/sync_agent.sh && cd /Users/vasilis/repos/AGENT && git add -A && git commit ; git push ; cd '
 
 alias pg_stuff='bat -p --paging=never -l sql /Users/vasilis/Data/work/tools/scripts/postgres/useful_sql/pg_stuff.txt'
 alias docker_stuff='bat -p --paging=never -l bash /Users/vasilis/Data/work/tools/scripts/docker/docker_stuff.txt'

@@ -53,11 +53,15 @@ cursor-style = underline
 cursor-style-blink = true
 shell-integration = zsh
 shell-integration-features = no-cursor,sudo,title,ssh-env,ssh-terminfo
-# New tabs/splits open in the current folder
-window-inherit-working-directory = true
+# New tabs, windows and splits all open in the home folder
+working-directory = home
+tab-inherit-working-directory = false
+split-inherit-working-directory = false
+window-inherit-working-directory = false
 # Restore windows and tabs after a restart
 window-save-state = always
 macos-titlebar-style = tabs
+#macos-titlebar-proxy-icon = hidden
 # Warn before pasting multi-line or unsafe text
 clipboard-paste-protection = true
 unfocused-split-opacity = 0.8
